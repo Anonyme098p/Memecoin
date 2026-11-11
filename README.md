@@ -110,7 +110,7 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `TELEGRAM_TOKEN`          | ✅ | Token du bot, donné par @BotFather |
 | `TELEGRAM_CHAT_ID`        | ✅ | Ton identifiant Telegram (un nombre) |
 | `HELIUS_API_KEY`          | ✅ | Clé API Helius |
-| `DB_PATH`                 | ✅ sur Railway | Chemin du fichier SQLite. Sur Railway : `/data/bot.db` |
+| `DB_PATH`                 | ❌ | Chemin **absolu** du fichier SQLite. Inutile sur Railway : si un volume est attaché, le bot utilise automatiquement `<Mount path du volume>/bot.db` (ex : `/data/bot.db`). Un chemin relatif (`./data/bot.db`) est ignoré avec un avertissement, car il serait effacé à chaque déploiement |
 | `PUBLIC_URL`              | ✅ pour les alertes | Ton domaine Railway, ex : `https://mon-bot.up.railway.app`. Si absent, le bot utilise `RAILWAY_PUBLIC_DOMAIN` (rempli par Railway) |
 | `HELIUS_WEBHOOK_SECRET`   | ✅ pour les alertes | Secret que Helius envoie dans l'en-tête `Authorization` de chaque requête. Sans lui, le webhook n'est pas créé et `/helius` refuse tout |
 | `HELIUS_TRANSACTION_TYPES`| ❌ | Types de transactions envoyés par Helius, séparés par des virgules (défaut : `ANY`). Voir plus bas |
@@ -617,12 +617,21 @@ Vérifie que le fichier `.env` n'y est **pas** (il est exclu grâce au `.gitigno
 
 ### Étape 6 — Ajouter un volume (pour que la base de données ne soit pas effacée)
 
-Sans volume, le fichier SQLite est **effacé à chaque redéploiement**.
+Sans volume, le fichier SQLite est **effacé à chaque redéploiement** (wallets suivis, devs,
+canaux, simulation… tout repart de zéro).
 
 1. Dans ton projet Railway, fais un **clic droit sur ton service** (ou utilise le bouton **+ Create**
    / la palette `Ctrl+K`) et choisis **Volume** / **Attach volume**.
 2. Indique comme **Mount path** : `/data`
 3. Valide.
+
+Quand un volume est attaché, Railway crée tout seul la variable `RAILWAY_VOLUME_MOUNT_PATH` : le bot
+la lit et range sa base dans `/data/bot.db`. **Tu n'as pas besoin de la variable `DB_PATH`** (si tu
+l'as déjà mise avec un chemin relatif comme `./data/bot.db`, supprime-la).
+
+Pour vérifier : au démarrage, le bot t'envoie le chemin de la base, le volume détecté et le nombre
+de wallets, devs et canaux enregistrés (aussi visibles dans `/status`). S'il n'y a pas de volume, il
+t'envoie l'alerte **« ⚠️ Aucun volume : la mémoire sera perdue à chaque mise à jour »**.
 
 ### Étape 7 — Ajouter les variables d'environnement
 
@@ -633,11 +642,11 @@ Sans volume, le fichier SQLite est **effacé à chaque redéploiement**.
    TELEGRAM_TOKEN=le_token_de_botfather
    TELEGRAM_CHAT_ID=ton_id_telegram
    HELIUS_API_KEY=ta_cle_helius
-   DB_PATH=/data/bot.db
    HELIUS_WEBHOOK_SECRET=une_longue_phrase_secrete
    ```
 
-   ⚠️ `DB_PATH` doit commencer par le *Mount path* du volume (`/data`).
+   Pas de `DB_PATH` : le volume de l'étape 6 est détecté automatiquement. Si tu tiens à la mettre,
+   elle doit être un chemin **absolu** sur le volume (ex : `/data/bot.db`).
 
    Pour `HELIUS_WEBHOOK_SECRET`, invente une longue suite de caractères (au moins 30), ou
    génère-la avec : `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
@@ -650,6 +659,7 @@ Sans volume, le fichier SQLite est **effacé à chaque redéploiement**.
    Tu dois voir des lignes comme :
    ```
    Base de données prête : /data/bot.db
+   Volume Railway : /data
    Bot Telegram démarré
    Boucle de surveillance démarrée
    ```
@@ -800,7 +810,8 @@ Où voir l'état de chaque module :
 | `The token ... was rejected by the server` | Le `TELEGRAM_TOKEN` est faux : recopie-le depuis @BotFather |
 | Pas de message « 🚀 Bot démarré » | Vérifie `TELEGRAM_CHAT_ID` et que tu as bien appuyé sur *Démarrer* dans la conversation avec ton bot |
 | Le bot ne répond pas à `/status` | Il ne répond qu'au chat ID configuré : vérifie que c'est bien le tien |
-| Les données disparaissent après un redéploiement | Le volume n'est pas monté, ou `DB_PATH` ne commence pas par `/data` |
+| Les données disparaissent après un redéploiement | Pas de volume attaché, ou `DB_PATH` pointe ailleurs que sur le volume. Regarde la section 💾 Stockage de `/status` : attache un volume (Mount path `/data`, étape 6) et supprime `DB_PATH` |
+| `⚠️ Aucun volume : la mémoire sera perdue à chaque mise à jour` | Aucun volume Railway détecté : attache-en un (étape 6) puis redéploie |
 | `Conflict: terminated by other getUpdates request` | Le bot tourne à deux endroits en même temps (local + Railway, ou 2 replicas) |
 | `⚠️ Webhook Helius NON mis à jour : la variable PUBLIC_URL est vide` | Génère un domaine Railway et ajoute `PUBLIC_URL` (étape 9) |
 | `⚠️ ... HELIUS_WEBHOOK_SECRET est vide` | Ajoute la variable `HELIUS_WEBHOOK_SECRET` (étape 7) |

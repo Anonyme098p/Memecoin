@@ -186,7 +186,11 @@ async def demarrer_bot(app: FastAPI) -> None:
 
     # --- Message de démarrage, avec ce qui ne tourne pas ---
     await asyncio.sleep(2)  # on laisse aux modules le temps d'indiquer leur état
-    lignes = ["🚀 Bot démarré.", etat_webhook]
+    lignes = ["🚀 Bot démarré.", etat_webhook, ""]
+    try:
+        lignes.append(db.texte_stockage(html_ok=False))
+    except Exception as erreur:
+        lignes.append(f"❌ Stockage illisible ({type(erreur).__name__})")
     hors_service = {n: e for n, e in supervision.etats.items() if e["statut"] in ("désactivé", "erreur")}
     if hors_service:
         lignes += ["", "⚠️ Modules désactivés (le reste fonctionne) :"]
@@ -198,6 +202,19 @@ async def demarrer_bot(app: FastAPI) -> None:
         await telegram_bot.envoyer_message(application, "\n".join(lignes))
     except Exception:
         log.exception("Impossible d'envoyer le message de démarrage (vérifie TELEGRAM_CHAT_ID)")
+
+    # Alerte à part, bien visible, si la base n'est pas sur un volume persistant
+    if not config.BASE_SUR_VOLUME:
+        texte = "⚠️ Aucun volume : la mémoire sera perdue à chaque mise à jour"
+        if config.VOLUME_RAILWAY:
+            texte = (f"⚠️ La base ({config.DB_PATH}) n'est pas sur le volume ({config.VOLUME_RAILWAY}) : "
+                     "la mémoire sera perdue à chaque mise à jour")
+        texte += ("\n\nSur Railway : clic droit sur le service → Attach volume, Mount path /data, puis redéploie. "
+                  "Supprime la variable DB_PATH (ou mets un chemin sur le volume, ex : /data/bot.db).")
+        try:
+            await telegram_bot.envoyer_message(application, texte)
+        except Exception:
+            log.exception("Impossible d'envoyer l'alerte de stockage")
 
 
 async def _synchroniser_webhook() -> str:
@@ -263,13 +280,17 @@ async def cycle_de_vie(app: FastAPI):
     else:
         try:
             db.init_db()
-            marquer("base de données", "actif")
-            log.info("Base de données prête : %s", config.DB_PATH)
+            marquer("base de données", "actif", None if config.BASE_SUR_VOLUME else "pas sur un volume persistant")
+            log.info("Base de données prête : %s", os.path.abspath(config.DB_PATH))
+            log.info("Volume Railway : %s", config.VOLUME_RAILWAY or "aucun")
+            log.info("Stockage : %s", db.texte_stockage(html_ok=False).replace("\n", " | "))
         except Exception as erreur:
             # Le serveur web reste en ligne pour que /health explique le problème
             marquer("base de données", "erreur", f"{type(erreur).__name__} : {erreur} (vérifie DB_PATH et le volume)"[:160])
     for nom, probleme in config.PROBLEMES.items():
         log.warning("Variable %s : %s", nom, probleme)
+    for avertissement in config.AVERTISSEMENTS_STOCKAGE:
+        log.warning("⚠️ Stockage : %s", avertissement)
     app.state.taches["démarrage du bot"] = asyncio.create_task(demarrer_bot(app))
     log.info("Serveur web en écoute sur 0.0.0.0:%d (le bot Telegram démarre en arrière-plan)", PORT)
 
@@ -307,9 +328,17 @@ async def sante() -> dict:
                   for nom, t in app.state.taches.items()}
         # Un module facultatif désactivé exprès (ex : veille sans ses variables) n'est pas une panne
         essentiels_ko = any(modules.get(n, {}).get("statut") != "actif" for n in ("base de données", "bot Telegram"))
-        degrade = (bool(config.PROBLEMES) or essentiels_ko
+        # Sur Railway, une base hors du volume est une vraie panne : tout sera perdu au prochain déploiement
+        stockage_ko = config.SUR_RAILWAY and not config.BASE_SUR_VOLUME
+        degrade = (bool(config.PROBLEMES) or essentiels_ko or stockage_ko
                    or any(m["statut"] == "erreur" for m in modules.values()))
-        reponse = {"statut": "degrade" if degrade else "ok", "modules": modules,
+        stockage = {}
+        if db:
+            r = db.resume_stockage()
+            stockage = {"volume_railway_detecte": bool(r["volume"]), "base_sur_le_volume": r["sur_volume"],
+                        "wallets": r.get("wallets"), "devs": r.get("devs"), "canaux": r.get("canaux"),
+                        "avertissements": r["avertissements"]}
+        reponse = {"statut": "degrade" if degrade else "ok", "stockage": stockage, "modules": modules,
                    "variables_a_corriger": config.PROBLEMES, "taches_de_fond": taches}
         if veille and db:
             reponse["veille_telegram"] = {"messages_lus": veille.etat["messages_lus"], "alertes": veille.etat["alertes"]}

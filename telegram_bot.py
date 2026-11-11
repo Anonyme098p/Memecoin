@@ -101,6 +101,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ]
     except Exception as erreur:
         lignes.append(f"❌ Base de données illisible ({type(erreur).__name__})")
+    lignes += ["", "<b>💾 Stockage</b>"]
+    try:
+        lignes.append(db.texte_stockage())
+        if not config.BASE_SUR_VOLUME:
+            lignes.append("⚠️ <b>Aucun volume : la mémoire sera perdue à chaque mise à jour</b>"
+                          if not config.VOLUME_RAILWAY else "⚠️ <b>La base n'est pas sur le volume : mémoire perdue à chaque mise à jour</b>")
+    except Exception as erreur:
+        lignes.append(f"❌ Stockage illisible ({type(erreur).__name__})")
     lignes += ["", f"<b>Clé Helius :</b> {config.masquer(config.HELIUS_API_KEY) if config.HELIUS_API_KEY else '⚠️ manquante'}",
                f"<b>Webhook :</b> {config.PUBLIC_URL + '/helius' if config.PUBLIC_URL else '⚠️ PUBLIC_URL non définie'}"
                " (détails : /webhook)"]

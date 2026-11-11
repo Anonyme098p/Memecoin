@@ -287,6 +287,46 @@ def connexion():
         conn.close()
 
 
+def resume_stockage() -> dict:
+    """Où est la base, est-elle sur le volume, et combien de wallets / devs / canaux elle contient."""
+    import config
+    resume = {
+        "chemin": os.path.abspath(DB_PATH),
+        "volume": config.VOLUME_RAILWAY or None,
+        "sur_volume": config.BASE_SUR_VOLUME,
+        "avertissements": list(config.AVERTISSEMENTS_STOCKAGE),
+    }
+    try:
+        with connexion() as conn:
+            for cle, table in (("wallets", "wallets_suivis"), ("devs", "devs_suivis"), ("canaux", "canaux_suivis")):
+                resume[cle] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        resume["taille_ko"] = round(os.path.getsize(DB_PATH) / 1024)
+    except Exception as erreur:
+        resume["erreur"] = type(erreur).__name__
+    return resume
+
+
+def texte_stockage(html_ok: bool = True) -> str:
+    """Résumé du stockage en quelques lignes (pour le démarrage et /status)."""
+    import html as module_html
+    r = resume_stockage()
+    echapper = module_html.escape if html_ok else (lambda t: t)
+    gras = (lambda t: f"<b>{t}</b>") if html_ok else (lambda t: t)
+    code = (lambda t: f"<code>{echapper(t)}</code>") if html_ok else (lambda t: t)
+    lignes = [f"{gras('Base :')} {code(r['chemin'])}"]
+    if r["volume"]:
+        lignes.append(f"{gras('Volume Railway :')} {'✅' if r['sur_volume'] else '⚠️'} détecté sur {code(r['volume'])}"
+                      + ("" if r["sur_volume"] else " — mais la base n'est PAS dessus"))
+    else:
+        lignes.append(f"{gras('Volume Railway :')} ⚠️ aucun")
+    if "erreur" in r:
+        lignes.append(f"❌ Base illisible ({r['erreur']})")
+    else:
+        lignes.append(f"{gras('Enregistrés :')} {r['wallets']} wallet(s), {r['devs']} dev(s), {r['canaux']} canal(aux)"
+                      f" · {r.get('taille_ko', 0)} Ko")
+    return "\n".join(lignes)
+
+
 def init_db() -> None:
     """Crée le dossier et les tables si besoin. À appeler une fois au démarrage."""
     dossier = os.path.dirname(os.path.abspath(DB_PATH))
