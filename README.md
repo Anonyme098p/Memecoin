@@ -3,9 +3,9 @@
 Bot Telegram personnel qui surveillera des wallets et des devs Solana et t'enverra des alertes.
 Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 
-> **État actuel :** la base du projet est prête (bot Telegram, base de données, serveur web,
-> boucle de surveillance). La logique de détection (appels à l'API Helius) reste à écrire dans
-> `modules/surveillance.py` et `modules/webhooks.py`.
+> **État actuel :** le suivi des wallets fonctionne. Dès qu'un wallet suivi achète un token
+> (SOL → token), tu reçois une alerte Telegram, et un **SIGNAL FORT** si plusieurs wallets
+> suivis achètent le même token en peu de temps. Le suivi des devs reste à écrire.
 
 ---
 
@@ -18,9 +18,12 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 ├── telegram_bot.py      # Le bot Telegram et ses commandes
 ├── db.py                # Base de données SQLite (tables + fonctions utiles)
 ├── modules/
-│   ├── alertes.py       # Envoi d'une alerte (pause, anti-doublon, historique)
-│   ├── surveillance.py  # Boucle qui tourne en fond (logique Helius à ajouter)
-│   └── webhooks.py      # Routes du serveur web (FastAPI)
+│   ├── wallets.py       # Suivi des wallets : commandes, détection des achats, alertes
+│   ├── helius.py        # Appels à l'API Helius (webhook, infos d'un token)
+│   ├── tokens.py        # Nom, symbole et prix d'un token (Helius + DexScreener)
+│   ├── webhooks.py      # Routes du serveur web (FastAPI), dont /helius
+│   ├── alertes.py       # Envoi d'une alerte générique (pause, anti-doublon, historique)
+│   └── surveillance.py  # Boucle qui tourne en fond (pour de futures fonctionnalités)
 ├── requirements.txt     # Bibliothèques Python à installer
 ├── railway.json         # Configuration Railway
 ├── Procfile             # Commande de démarrage (alternative à railway.json)
@@ -36,6 +39,9 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/status` | État (actif / en pause), durée en ligne, nombre de wallets/devs suivis, alertes, trades simulés |
 | `/pause`  | Met les alertes en pause (le réglage est conservé même après un redémarrage) |
 | `/resume` | Relance les alertes |
+| `/addwallet <adresse> <surnom>` | Suit un wallet (le surnom peut contenir des espaces). Le webhook Helius est mis à jour tout seul |
+| `/removewallet <adresse>` | Arrête de suivre un wallet (et met à jour le webhook Helius) |
+| `/wallets` | Liste des wallets suivis |
 
 🔒 Le bot **ne répond qu'à ton chat** (`TELEGRAM_CHAT_ID`). Les autres personnes sont ignorées.
 
@@ -45,7 +51,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 |--------------------|---------|
 | `wallets_suivis`   | Wallets Solana surveillés (adresse, surnom) |
 | `devs_suivis`      | Devs (créateurs de tokens) surveillés, avec une note |
-| `alertes_envoyees` | Historique des alertes envoyées (sert aussi à éviter les doublons) |
+| `alertes_envoyees` | Historique des alertes : heure, wallet, montant, **prix en SOL et en $ au moment du signal**, statut (envoyée / ignorée) |
+| `achats_wallets`   | Chaque achat détecté (même bot en pause) : sert à repérer les SIGNAUX FORTS |
 | `trades_simules`   | Trades fictifs : mise en SOL, prix d'entrée/sortie, gain/perte |
 | `parametres`       | Petits réglages (ex : pause on/off) |
 
@@ -57,13 +64,51 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `TELEGRAM_CHAT_ID`        | ✅ | Ton identifiant Telegram (un nombre) |
 | `HELIUS_API_KEY`          | ✅ | Clé API Helius |
 | `DB_PATH`                 | ✅ sur Railway | Chemin du fichier SQLite. Sur Railway : `/data/bot.db` |
-| `WEBHOOK_SECRET`          | ❌ | Secret attendu dans l'en-tête `Authorization` des webhooks |
+| `PUBLIC_URL`              | ✅ pour les alertes | Ton domaine Railway, ex : `https://mon-bot.up.railway.app`. Si absent, le bot utilise `RAILWAY_PUBLIC_DOMAIN` (rempli par Railway) |
+| `WEBHOOK_SECRET`          | ❌ | Secret que Helius doit envoyer dans l'en-tête `Authorization`. Si absent, il est calculé automatiquement à partir de ta clé Helius |
+| `SIGNAL_FORT_MIN_WALLETS` | ❌ | Nombre de wallets pour un SIGNAL FORT (défaut : 2) |
+| `SIGNAL_FORT_MINUTES`     | ❌ | Fenêtre de temps du SIGNAL FORT, en minutes (défaut : 10) |
 | `INTERVALLE_SURVEILLANCE` | ❌ | Secondes entre deux tours de surveillance (défaut : 60) |
 | `LOG_LEVEL`               | ❌ | `DEBUG`, `INFO` (défaut), `WARNING`, `ERROR` |
 | `PORT`                    | ❌ | Fourni automatiquement par Railway, ne pas le définir |
 
 ⚠️ **Ne mets jamais tes clés dans le code ni sur GitHub.** Elles vont uniquement dans
 l'onglet *Variables* de Railway (ou dans un fichier `.env` local, qui est ignoré par Git).
+
+---
+
+## 👛 Comment marche le suivi des wallets
+
+1. Tu envoies `/addwallet 7xKX...gAsU Baleine` au bot.
+2. Le bot crée (ou met à jour) **un webhook Helius** qui surveille tous tes wallets et envoie
+   chaque transaction, déjà décodée (format *enhanced*), à `PUBLIC_URL/helius`.
+3. À chaque transaction reçue, le bot vérifie qu'elle vient bien de Helius (en-tête
+   `Authorization` = ton secret), répond tout de suite, puis cherche un **achat** :
+   le wallet a dépensé des SOL et reçu un token qui n'est ni du SOL, ni de l'USDC, ni de l'USDT.
+4. Il t'envoie alors une alerte :
+
+   ```
+   🟢 Baleine vient d'acheter
+   🪙 MEME — Meme Coin
+   💰 Montant : 1.500 SOL
+   💵 Prix : 0.000001500 SOL (≈ $0.0002130)
+   📄 Contrat : MeMe...pump
+   🔗 DexScreener | GMGN | Transaction
+   [ 🛒 Acheter ]  [ 🙈 Ignorer ]
+   ```
+
+   - **Acheter** ouvre la page d'échange SOL → token sur Jupiter (rien n'est acheté automatiquement).
+   - **Ignorer** retire les boutons et marque l'alerte comme ignorée dans la base.
+5. Si **au moins 2 wallets suivis** achètent le **même token en moins de 10 minutes**,
+   l'alerte commence par **🚨🚨 SIGNAL FORT 🚨🚨** et liste tous les acheteurs.
+
+Bon à savoir :
+- Pendant une pause (`/pause`), les achats sont quand même enregistrés (pour le SIGNAL FORT),
+  mais aucune alerte n'est envoyée.
+- Helius envoie parfois deux fois la même transaction : le bot ne t'alerte qu'une seule fois.
+- Le montant en SOL des achats pump.fun peut inclure de petits frais (c'est une estimation).
+- Chaque création ou modification du webhook consomme des crédits Helius : le bot ne contacte
+  Helius que si la liste des wallets ou l'adresse a vraiment changé.
 
 ---
 
@@ -137,16 +182,33 @@ Sans volume, le fichier SQLite est **effacé à chaque redéploiement**.
 2. Sur Telegram, tu reçois le message **🚀 Bot démarré.**
 3. Envoie `/status` à ton bot : il te répond avec son état.
 
-### Étape 9 (optionnel, pour plus tard) — Obtenir une adresse web publique
+### Étape 9 — Obtenir une adresse web publique (indispensable pour les alertes)
 
-Pour recevoir des webhooks (par exemple de Helius), il faut une URL publique :
+Helius a besoin d'une adresse publique pour envoyer les transactions à ton bot :
 
 1. Clique sur ton service → onglet **Settings** → section **Networking** → **Generate Domain**.
+   Si Railway demande un port, laisse celui proposé (le bot écoute sur la variable `PORT`).
 2. Tu obtiens une adresse du type `https://mon-bot.up.railway.app`.
-3. Test : ouvre `https://mon-bot.up.railway.app/health` dans ton navigateur → `{"statut":"ok",...}`.
-4. L'URL à donner à Helius sera : `https://mon-bot.up.railway.app/webhooks/helius`.
-   Pour la sécuriser, ajoute une variable `WEBHOOK_SECRET` sur Railway et mets la même valeur
-   dans le champ *Authorization header* du webhook côté Helius.
+3. Dans l'onglet **Variables**, ajoute :
+   ```
+   PUBLIC_URL=https://mon-bot.up.railway.app
+   ```
+4. Test : ouvre `https://mon-bot.up.railway.app/health` dans ton navigateur → `{"statut":"ok",...}`.
+
+**Tu n'as rien à configurer chez Helius** : le bot crée lui-même le webhook (pointant vers
+`https://mon-bot.up.railway.app/helius`, avec le secret d'authentification) dès que tu ajoutes
+un premier wallet. Tu peux le voir sur [dashboard.helius.dev/webhooks](https://dashboard.helius.dev/webhooks).
+
+### Étape 10 — Ajouter tes premiers wallets
+
+Sur Telegram, envoie à ton bot :
+
+```
+/addwallet 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU Baleine
+```
+
+Le bot répond « ✅ Wallet ajouté » puis « 🔔 Webhook Helius à jour ». Tape `/wallets` pour
+voir la liste. Si tu vois « ⚠️ PUBLIC_URL est vide », reviens à l'étape 9.
 
 ### Mettre à jour le bot
 
@@ -193,13 +255,17 @@ instance** (replica) sur Railway.
 | Le bot ne répond pas à `/status` | Il ne répond qu'au chat ID configuré : vérifie que c'est bien le tien |
 | Les données disparaissent après un redéploiement | Le volume n'est pas monté, ou `DB_PATH` ne commence pas par `/data` |
 | `Conflict: terminated by other getUpdates request` | Le bot tourne à deux endroits en même temps (local + Railway, ou 2 replicas) |
+| `⚠️ Webhook Helius NON mis à jour : la variable PUBLIC_URL est vide` | Génère un domaine Railway et ajoute `PUBLIC_URL` (étape 9) |
+| `❌ Erreur Helius ... 401` | `HELIUS_API_KEY` est fausse |
+| `❌ Erreur Helius ... 429` ou limite de webhooks | Trop de requêtes, ou trop de webhooks sur ton compte Helius (5 en gratuit) : supprime les anciens sur le dashboard Helius |
+| Wallet ajouté mais aucune alerte | Vérifie dans les logs Railway la ligne `Webhook Helius reçu`. Si elle n'apparaît jamais, regarde les logs du webhook sur le dashboard Helius. Si tu vois `Requête refusée sur /helius`, renvoie `/addwallet` sur un wallet existant pour resynchroniser le secret |
 
 ---
 
 ## ➕ Et ensuite ?
 
-- Écrire dans `modules/surveillance.py` les appels à l'API Helius pour détecter les achats des wallets suivis.
-- Traiter les webhooks Helius dans `modules/webhooks.py`.
-- Ajouter des commandes Telegram (ex : `/addwallet <adresse> <nom>`) dans `telegram_bot.py`
-  en utilisant les fonctions déjà prêtes de `db.py` (`ajouter_wallet`, `ajouter_dev`, `ouvrir_trade`...).
-- Toujours envoyer les alertes via `modules.alertes.envoyer_alerte()` pour respecter `/pause`.
+- Suivre les devs (table `devs_suivis`) sur le même principe que `modules/wallets.py`.
+- Alerter aussi sur les ventes des wallets suivis.
+- Ouvrir automatiquement un trade simulé à chaque SIGNAL FORT (`db.ouvrir_trade`) pour mesurer
+  la qualité des signaux.
+- Toujours vérifier `db.est_en_pause()` avant d'envoyer une alerte, pour respecter `/pause`.

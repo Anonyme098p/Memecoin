@@ -5,6 +5,8 @@ Aucune clé secrète n'est écrite dans le code : tout vient de l'environnement
 (onglet "Variables" sur Railway, ou fichier .env en local).
 """
 
+import hashlib
+import hmac
 import os
 import sys
 
@@ -56,9 +58,34 @@ DB_PATH: str = os.getenv("DB_PATH", "./data/bot.db").strip()
 # Railway fournit automatiquement la variable PORT. En local, on utilise 8000.
 PORT: int = int(os.getenv("PORT", "8000"))
 
-# Secret optionnel pour protéger les webhooks (on vérifiera l'en-tête Authorization).
-# Laisse vide tant que tu n'utilises pas encore les webhooks.
-WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "").strip()
+# Adresse publique du bot (le domaine Railway), ex : https://mon-bot.up.railway.app
+# Helius enverra les transactions sur PUBLIC_URL + "/helius".
+# Si PUBLIC_URL n'est pas définie, on utilise RAILWAY_PUBLIC_DOMAIN, que Railway
+# remplit tout seul dès que tu as cliqué sur "Generate Domain".
+def _url_publique() -> str:
+    url = os.getenv("PUBLIC_URL", "").strip() or os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url.rstrip("/")
+
+
+PUBLIC_URL: str = _url_publique()
+
+# Secret que Helius met dans l'en-tête "Authorization" de chaque requête :
+# il prouve que la requête vient bien de Helius.
+# Si tu ne le définis pas, il est calculé à partir de ta clé Helius
+# (il reste donc secret et identique d'un redémarrage à l'autre).
+WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "").strip() or hmac.new(
+    HELIUS_API_KEY.encode(), b"webhook-helius", hashlib.sha256
+).hexdigest()
+
+# --- Signal fort ---
+# Si au moins SIGNAL_FORT_MIN_WALLETS wallets suivis achètent le même token
+# en moins de SIGNAL_FORT_MINUTES minutes, l'alerte est marquée SIGNAL FORT.
+SIGNAL_FORT_MIN_WALLETS: int = int(os.getenv("SIGNAL_FORT_MIN_WALLETS", "2"))
+SIGNAL_FORT_MINUTES: int = int(os.getenv("SIGNAL_FORT_MINUTES", "10"))
 
 # --- Divers ---
 # Intervalle (en secondes) entre deux tours de la boucle de surveillance
