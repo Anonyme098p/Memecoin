@@ -236,8 +236,16 @@ COLONNES_AJOUTEES = {
         "prix_max": "REAL",              # plus haut prix vu pendant la position
         "ouvert_le": "INTEGER",          # timestamp Unix
         "ferme_le": "INTEGER",
-        "raison_sortie": "TEXT",         # prise de profit, stop loss, durée max...
+        "raison_sortie": "TEXT",         # prise de profit, stop loss, durée max, vente manuelle...
         "pnl_pct": "REAL",
+        "vente_manuelle": "INTEGER",     # 1 si vendu par toi (/vendre ou bouton), sinon par les règles
+        "parent_id": "INTEGER",          # vente partielle : id de la position d'origine
+        # Vente manuelle : on continue de suivre le prix pour savoir ce que les RÈGLES auraient fait
+        "regles_statut": "TEXT",         # 'en_cours' puis 'fini'
+        "regles_prix": "REAL",           # dernier prix vu pendant ce suivi
+        "regles_pnl_sol": "REAL",        # résultat si tu avais laissé les règles décider
+        "regles_pnl_pct": "REAL",
+        "regles_raison": "TEXT",
     },
     "wallets_suivis": {
         "note": "INTEGER",          # dernière note d'analyse (0 à 100)
@@ -803,6 +811,74 @@ def fermer_position(trade_id: int, prix_marche: float | None, frais_pct: float, 
             "ferme_le = ?, date_fermeture = ?, prix_actuel = COALESCE(?, prix_actuel) WHERE id = ?",
             (prix_marche, pnl, pnl / t["montant_sol"] * 100, raison, ferme_le, maintenant(), prix_marche, trade_id),
         )
+
+
+def lire_position(trade_id: int) -> sqlite3.Row | None:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM trades_simules WHERE id = ? AND portefeuille IS NOT NULL",
+                            (trade_id,)).fetchone()
+
+
+def vendre_position(trade_id: int, pourcentage: float, prix_marche: float, frais_pct: float,
+                    ferme_le: int) -> dict | None:
+    """
+    Vente manuelle de `pourcentage` % d'une position ouverte, au prix `prix_marche` moins les frais.
+      - 100 % : la position est fermée ;
+      - moins : la part vendue devient un trade fermé à part (lié par parent_id), et la position
+        garde le reste de la mise (même prix d'achat).
+    Renvoie {"vendu_sol", "pnl_sol", "pnl_pct", "reste_sol", "trade_id"} ou None si la position n'est plus ouverte.
+    """
+    with connexion() as conn:
+        t = conn.execute("SELECT * FROM trades_simules WHERE id = ? AND statut = 'ouvert'", (trade_id,)).fetchone()
+        if t is None or not t["prix_entree"]:
+            return None
+        part = min(max(pourcentage, 0), 100) / 100
+        vendu = t["montant_sol"] * part
+        pnl = vendu * prix_marche * (1 - frais_pct / 100) / t["prix_entree"] - vendu
+        pnl_pct = pnl / vendu * 100 if vendu else 0
+        deja_vendu = conn.execute("SELECT COUNT(*) FROM trades_simules WHERE parent_id = ?", (trade_id,)).fetchone()[0]
+        raison = f"vente manuelle ({pourcentage:g} %{' du reste' if deja_vendu else ''})"
+        if part >= 0.999:  # tout vendre : on ferme la position elle-même
+            conn.execute(
+                "UPDATE trades_simules SET statut = 'ferme', prix_sortie = ?, pnl_sol = ?, pnl_pct = ?, "
+                "raison_sortie = ?, ferme_le = ?, date_fermeture = ?, prix_actuel = ?, vente_manuelle = 1, "
+                "regles_statut = 'en_cours', regles_prix = ? WHERE id = ?",
+                (prix_marche, pnl, pnl_pct, raison, ferme_le, maintenant(), prix_marche, prix_marche, trade_id),
+            )
+            return {"vendu_sol": vendu, "pnl_sol": pnl, "pnl_pct": pnl_pct, "reste_sol": 0.0, "trade_id": trade_id}
+        curseur = conn.execute(
+            "INSERT INTO trades_simules (token_adresse, symbole, montant_sol, prix_entree, prix_sortie, statut, pnl_sol, "
+            "date_ouverture, date_fermeture, portefeuille, alerte_id, type_alerte, wallet_adresse, prix_entree_marche, "
+            "prix_actuel, prix_max, ouvert_le, ferme_le, raison_sortie, pnl_pct, vente_manuelle, parent_id, "
+            "regles_statut, regles_prix) VALUES (?, ?, ?, ?, ?, 'ferme', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, "
+            "'en_cours', ?)",
+            (t["token_adresse"], t["symbole"], vendu, t["prix_entree"], prix_marche, pnl, t["date_ouverture"],
+             maintenant(), t["portefeuille"], t["alerte_id"], t["type_alerte"], t["wallet_adresse"],
+             t["prix_entree_marche"], prix_marche, t["prix_max"], t["ouvert_le"], ferme_le, raison, pnl_pct,
+             trade_id, prix_marche),
+        )
+        conn.execute("UPDATE trades_simules SET montant_sol = ?, prix_actuel = ? WHERE id = ?",
+                     (t["montant_sol"] - vendu, prix_marche, trade_id))
+        return {"vendu_sol": vendu, "pnl_sol": pnl, "pnl_pct": pnl_pct, "reste_sol": t["montant_sol"] - vendu,
+                "trade_id": curseur.lastrowid}
+
+
+def suivis_regles_en_cours() -> list[sqlite3.Row]:
+    """Ventes manuelles dont on suit encore le prix pour savoir ce que les règles auraient fait."""
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM trades_simules WHERE vente_manuelle = 1 AND regles_statut = 'en_cours'"
+                            ).fetchall()
+
+
+def maj_suivi_regles(trade_id: int, prix: float | None, fini: bool = False, pnl_sol: float | None = None,
+                     pnl_pct: float | None = None, raison: str | None = None) -> None:
+    with connexion() as conn:
+        if fini:
+            conn.execute("UPDATE trades_simules SET regles_statut = 'fini', regles_prix = COALESCE(?, regles_prix), "
+                         "regles_pnl_sol = ?, regles_pnl_pct = ?, regles_raison = ? WHERE id = ?",
+                         (prix, pnl_sol, pnl_pct, raison, trade_id))
+        else:
+            conn.execute("UPDATE trades_simules SET regles_prix = ? WHERE id = ?", (prix, trade_id))
 
 
 def trades_fermes(portefeuille: str | None = None, limite: int | None = None) -> list[sqlite3.Row]:

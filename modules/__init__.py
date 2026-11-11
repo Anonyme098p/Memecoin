@@ -7,7 +7,7 @@ Dossier modules/ : les fonctionnalités du bot, chacune dans son fichier.
   - wallets.py      : suivi des wallets (/addwallet, /removewallet, /wallets) et alertes d'achat
   - nouveaux_tokens.py : créations pump.fun en temps réel, devs suivis, /scanall, /devscore
   - veille.py       : veille de canaux Telegram avec un compte utilisateur (lecture seule), page /tglogin
-  - simulation.py   : trades simulés « Bot seul » / « Mes choix », /stats, /journal, /positions
+  - simulation.py   : trades simulés « Bot seul » / « Mes choix », /stats, /journal, /positions, /vendre
   - ia.py           : avis IA sur les alertes (haussier, baissier, juge) et revue de la semaine
   - regles.py       : changements acceptés de rules.json et versions (/rules, /rollback)
   - analyse.py      : note de sécurité d'un token (0 à 100), règles dans rules.json

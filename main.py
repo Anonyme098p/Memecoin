@@ -141,6 +141,7 @@ async def demarrer_bot(app: FastAPI) -> None:
     app.state.telegram = application  # utilisé par les routes web (webhook Helius, /tglogin)
     marquer("bot Telegram", "actif")
     log.info("Bot Telegram démarré")
+    await telegram_bot.enregistrer_menu(application)  # menu qui s'affiche quand tu tapes « / »
     await _verifier_regles()
 
     # --- Modules en tâches de fond : chacun tourne et plante tout seul ---

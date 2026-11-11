@@ -14,7 +14,13 @@ Frais + glissement : 2 % à l'achat ET à la vente.
 Les résultats sont calculés à partir du prix en dollars du token (les variations du SOL lui-même
 sont ignorées). Tout est enregistré dans la base (Volume Railway) : rien n'est perdu au redémarrage.
 
-Commandes : /stats, /journal, /positions (+ bouton ✅ Accepter sous chaque alerte)
+Vente manuelle : sous chaque position de /positions, boutons « Vendre 50 % », « Vendre 100 % » et
+« Actualiser » (ou /vendre <token ou numéro> <pourcentage>). La vente se fait au prix DexScreener du
+moment moins les frais, et apparaît dans /journal avec la mention « vente manuelle ». Après une vente
+manuelle, le bot continue de suivre le prix pour calculer ce que les RÈGLES auraient donné : /stats
+compare ainsi tes interventions aux ventes automatiques.
+
+Commandes : /stats, /journal, /positions, /vendre (+ bouton ✅ Accepter sous chaque alerte)
 """
 
 import asyncio
@@ -157,6 +163,20 @@ def programmer(alerte_id: int | None, type_alerte: str, mint: str, symbole: str 
 # Boucle : toutes les minutes
 # ---------------------------------------------------------------------------
 
+def raison_regles(variation_pct: float, prix_frais: bool, age_s: float, r: dict) -> str | None:
+    """
+    Les règles de sortie automatique (rules.json) : renvoie la raison de vendre, ou None pour garder.
+    `prix_frais` : True si le prix vient d'être relevé (sinon, seule la durée max peut déclencher la vente).
+    """
+    if prix_frais and variation_pct >= r["tp"]:
+        return f"prise de profit (+{r['tp']:.0f} %)"
+    if prix_frais and variation_pct <= r["sl"]:
+        return f"stop loss ({r['sl']:.0f} %)"
+    if age_s >= r["duree_h"] * 3600:
+        return f"durée max ({r['duree_h']:.0f} h)" + ("" if prix_frais else " — dernier prix connu")
+    return None
+
+
 def _releves_utiles(maintenant: int) -> list:
     """Relevés de prix dus maintenant (on ignore ceux dont la fenêtre est passée)."""
     utiles = []
@@ -175,8 +195,10 @@ async def un_tour(maintenant: int | None = None) -> dict:
     r = regles()
     maintenant = int(maintenant or time.time())
     ouvertes, releves = db.positions(), _releves_utiles(maintenant)
-    mints = sorted({p["token_adresse"] for p in ouvertes} | {s["mint"] for s in releves})
-    bilan = {"verifies": len(mints), "ouverts": 0, "fermes": 0, "annules": 0, "releves": 0}
+    suivis_regles = db.suivis_regles_en_cours()  # ventes manuelles : que feraient les règles ?
+    mints = sorted({p["token_adresse"] for p in ouvertes} | {s["mint"] for s in releves}
+                   | {v["token_adresse"] for v in suivis_regles})
+    bilan = {"verifies": len(mints), "ouverts": 0, "fermes": 0, "annules": 0, "releves": 0, "regles_finies": 0}
     if not mints:
         return bilan
     try:
@@ -199,16 +221,25 @@ async def un_tour(maintenant: int | None = None) -> dict:
             db.maj_prix_position(p["id"], actuel)
         dernier = actuel or p["prix_actuel"]
         variation = (dernier / p["prix_entree_marche"] - 1) * 100 if dernier and p["prix_entree_marche"] else 0
-        raison = None
-        if actuel and variation >= r["tp"]:
-            raison = f"prise de profit (+{r['tp']:.0f} %)"
-        elif actuel and variation <= r["sl"]:
-            raison = f"stop loss ({r['sl']:.0f} %)"
-        elif maintenant - (p["ouvert_le"] or maintenant) >= r["duree_h"] * 3600:
-            raison = f"durée max ({r['duree_h']:.0f} h)" + ("" if actuel else " — dernier prix connu")
+        raison = raison_regles(variation, bool(actuel), maintenant - (p["ouvert_le"] or maintenant), r)
         if raison:
             db.fermer_position(p["id"], dernier, r["frais"], raison, maintenant)
             bilan["fermes"] += 1
+
+    # Ventes manuelles : on applique les règles au prix du moment, comme si tu n'avais rien fait
+    for v in suivis_regles:
+        actuel = prix.get(v["token_adresse"])
+        dernier = actuel or v["regles_prix"]
+        variation = (dernier / v["prix_entree_marche"] - 1) * 100 if dernier and v["prix_entree_marche"] else 0
+        raison = raison_regles(variation, bool(actuel), maintenant - (v["ouvert_le"] or maintenant), r)
+        if raison:
+            pnl = (v["montant_sol"] * (dernier or 0) * (1 - r["frais"] / 100) / v["prix_entree"] - v["montant_sol"]
+                   if v["prix_entree"] else 0)
+            db.maj_suivi_regles(v["id"], actuel, fini=True, pnl_sol=pnl, pnl_pct=pnl / v["montant_sol"] * 100,
+                                raison=raison)
+            bilan["regles_finies"] += 1
+        elif actuel:
+            db.maj_suivi_regles(v["id"], actuel)
 
     for s in releves:
         actuel = prix.get(s["mint"])
@@ -393,6 +424,8 @@ async def texte_stats() -> str:
         for adresse, trades in classes[:10]:
             lignes.append(_ligne_resume(html.escape(_nom_wallet(adresse)), _resume(trades), eur))
 
+    lignes += ["", *_lignes_manuel_contre_auto(fermes, eur)]
+
     # Décisions : avais-tu raison d'ignorer ?
     acceptees = [s for s in suivis if s["decision"] == "acceptee"]
     ignorees = [s for s in suivis if s["decision"] == "ignoree"]
@@ -403,6 +436,47 @@ async def texte_stats() -> str:
     if not fermes and not ouverts:
         lignes += ["", "Aucun trade simulé pour l'instant : ils démarrent avec les prochaines alertes."]
     return "\n".join(lignes)
+
+
+def _lignes_manuel_contre_auto(fermes: list, eur: float | None) -> list[str]:
+    """/stats : ventes faites par les règles contre ventes faites par toi (et ce que les règles auraient fait)."""
+    auto = [t for t in fermes if not t["vente_manuelle"]]
+    manu = [t for t in fermes if t["vente_manuelle"]]
+    lignes = ["<b>⚙️ Ventes automatiques  contre  ✋ ventes manuelles</b>"]
+
+    def detail(nom: str, x: dict) -> str:
+        if not x["n"]:
+            return f"• {nom} : aucune vente"
+        ligne = f"• {nom} : {x['n']} vente(s) · {x['reussite']:.0f} % gagnantes · {_sol_eur(x['total'], eur)}"
+        morceaux = []
+        if x["gain"] is not None:
+            morceaux.append(f"gain moyen {x['gain']:+.3f} SOL ({x['gain_pct']:+.0f} %)")
+        if x["perte"] is not None:
+            morceaux.append(f"perte moyenne {x['perte']:+.3f} SOL ({x['perte_pct']:+.0f} %)")
+        return ligne + ("\n   " + " · ".join(morceaux) if morceaux else "")
+
+    lignes.append(detail("⚙️ par les règles", _resume(auto)))
+    if not manu:
+        lignes.append("• ✋ par toi : aucune vente manuelle pour l'instant (boutons sous /positions, ou /vendre)")
+        return lignes
+    lignes.append(detail("✋ par toi", _resume(manu)))
+
+    # Même trades, deux façons de sortir : c'est la comparaison la plus juste
+    finis = [t for t in manu if t["regles_statut"] == "fini"]
+    en_cours = len(manu) - len(finis)
+    if finis:
+        toi = sum(t["pnl_sol"] or 0 for t in finis)
+        regles_seules = sum(t["regles_pnl_sol"] or 0 for t in finis)
+        ecart = toi - regles_seules
+        verdict = ("✅ tes interventions ont fait MIEUX que les règles" if ecart > 0.00005 else
+                   "❌ tes interventions ont fait MOINS BIEN que les règles" if ecart < -0.00005 else
+                   "➖ même résultat que les règles")
+        lignes.append(f"• Sur ces mêmes {len(finis)} vente(s), si tu avais laissé faire les règles : "
+                      f"{_sol_eur(regles_seules, eur)} au lieu de {_sol_eur(toi, eur)}\n"
+                      f"   {verdict} : écart {_sol_eur(ecart, eur)}")
+    if en_cours:
+        lignes.append(f"   <i>{en_cours} vente(s) manuelle(s) encore suivie(s) : les règles n'auraient pas encore vendu</i>")
+    return lignes
 
 
 def _duree(secondes: float) -> str:
@@ -422,39 +496,227 @@ def texte_journal(limite: int = 10) -> str:
         origine = NOMS_TYPES.get(t["type_alerte"], t["type_alerte"] or "?")
         if t["type_alerte"] in ("achat_wallet", "signal_fort"):
             origine += f" {_nom_wallet(t['wallet_adresse'])}"
+        raison = html.escape(t["raison_sortie"] or "?")
+        if t["vente_manuelle"]:
+            raison = "✋ " + raison
+            if t["regles_statut"] == "fini" and t["regles_pnl_sol"] is not None:
+                raison += f" (les règles : {t['regles_pnl_sol']:+.4f} SOL)"
         lignes.append(
             f"{icone} <b>{(t['pnl_sol'] or 0):+.4f} SOL</b> ({(t['pnl_pct'] or 0):+.0f} %) · "
             f"<b>{html.escape(t['symbole'] or t['token_adresse'][:6])}</b> · {PORTEFEUILLES.get(t['portefeuille'], '?')}\n"
-            f"   {html.escape(origine)} · {html.escape(t['raison_sortie'] or '?')} · "
+            f"   {html.escape(origine)} · {raison} · "
             f"gardé {_duree((t['ferme_le'] or 0) - (t['ouvert_le'] or 0))} · {quand}"
         )
     return "\n".join(lignes)
 
 
-def texte_positions() -> str:
+def _valeur_nette(p, prix: float | None, frais_pct: float) -> float | None:
+    """Gain ou perte en SOL si on vendait maintenant à `prix` (frais de sortie déduits)."""
+    if not prix or not p["prix_entree"]:
+        return None
+    return p["montant_sol"] * prix * (1 - frais_pct / 100) / p["prix_entree"] - p["montant_sol"]
+
+
+def texte_carte(p, eur: float | None) -> str:
+    """Le détail d'une position ouverte (affiché sous /positions, avec ses boutons)."""
+    r, maintenant = regles(), time.time()
+    nom = html.escape(p["symbole"] or p["token_adresse"][:6])
+    origine = NOMS_TYPES.get(p["type_alerte"], p["type_alerte"] or "?")
+    if p["type_alerte"] in ("achat_wallet", "signal_fort"):
+        origine += f" {_nom_wallet(p['wallet_adresse'])}"
+    entete = f"<b>#{p['id']} · {nom}</b> · {PORTEFEUILLES.get(p['portefeuille'], '?')} · {html.escape(origine)}"
+    lien = f'<a href="https://dexscreener.com/solana/{p["token_adresse"]}">DexScreener</a>'
+    if p["statut"] == "en_attente":
+        return f"⏳ {entete}\n   en attente du premier prix sur DexScreener · {lien}"
+    net = _valeur_nette(p, p["prix_actuel"], r["frais"]) or 0
+    net_pct = net / p["montant_sol"] * 100 if p["montant_sol"] else 0
+    marche = (p["prix_actuel"] / p["prix_entree_marche"] - 1) * 100 if p["prix_actuel"] and p["prix_entree_marche"] else 0
+    restant = r["duree_h"] * 3600 - (maintenant - (p["ouvert_le"] or maintenant))
+    return "\n".join([
+        f"{'🟢' if net > 0 else '🔴'} {entete}",
+        f"   Mise : {p['montant_sol']:.4g} SOL",
+        f"   Prix d'achat : {_prix(p['prix_entree_marche'])} · prix actuel : {_prix(p['prix_actuel'])} "
+        f"({marche:+.0f} %)",
+        f"   <b>Si vendu maintenant : {net_pct:+.0f} % · {_sol_eur(net, eur)}</b> "
+        f"<i>(frais {r['frais']:g} % compris)</i>",
+        f"   Ouvert depuis {_duree(maintenant - (p['ouvert_le'] or maintenant))} · sortie auto à "
+        f"+{r['tp']:.0f} % / {r['sl']:.0f} % ou dans {_duree(max(0, restant))} · {lien}",
+    ])
+
+
+def boutons_position(p) -> InlineKeyboardMarkup:
+    ligne_maj = [InlineKeyboardButton("🔄 Actualiser", callback_data=f"sim_maj:{p['id']}")]
+    if p["statut"] != "ouvert":
+        return InlineKeyboardMarkup([ligne_maj])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💸 Vendre 50 %", callback_data=f"sim_vendre:{p['id']}:50"),
+         InlineKeyboardButton("💸 Vendre 100 %", callback_data=f"sim_vendre:{p['id']}:100")],
+        ligne_maj,
+    ])
+
+
+async def _actualiser_prix(liste: list) -> None:
+    """Relève le prix DexScreener des positions avant de les afficher (sans planter si c'est injoignable)."""
+    mints = sorted({p["token_adresse"] for p in liste if p["statut"] == "ouvert"})
+    if not mints:
+        return
+    try:
+        prix = await prix_actuels(mints)
+    except Exception:
+        log.warning("Simulation : prix DexScreener indisponibles pour /positions")
+        return
+    for p in liste:
+        if p["token_adresse"] in prix and p["statut"] == "ouvert":
+            db.maj_prix_position(p["id"], prix[p["token_adresse"]][0])
+
+
+MAX_CARTES = 15  # au-delà, on liste les positions en une ligne (trop de messages sinon)
+
+
+async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ouverts = db.positions()
     if not ouverts:
-        return "📂 Aucune position simulée ouverte."
-    r, maintenant = regles(), time.time()
-    lignes = [f"📂 <b>{len(ouverts)} position(s) simulée(s) ouverte(s)</b>", ""]
-    for p in ouverts:
-        nom = html.escape(p["symbole"] or p["token_adresse"][:6])
-        restant = r["duree_h"] * 3600 - (maintenant - (p["ouvert_le"] or maintenant))
-        if p["statut"] == "en_attente":
-            lignes.append(f"⏳ <b>{nom}</b> · {PORTEFEUILLES.get(p['portefeuille'])} · en attente du premier prix")
-            continue
-        variation = (p["prix_actuel"] / p["prix_entree_marche"] - 1) * 100 if p["prix_actuel"] and p["prix_entree_marche"] else 0
-        net = (p["montant_sol"] * p["prix_actuel"] * (1 - r["frais"] / 100) / p["prix_entree"] - p["montant_sol"]
-               if p["prix_actuel"] and p["prix_entree"] else 0)
-        lignes.append(
-            f"{'🟢' if net > 0 else '🔴'} <b>{nom}</b> · {PORTEFEUILLES.get(p['portefeuille'])} · "
-            f"{NOMS_TYPES.get(p['type_alerte'], '?')}\n"
-            f"   entrée {_prix(p['prix_entree_marche'])} → {_prix(p['prix_actuel'])} ({variation:+.0f} %) · "
-            f"si vendu maintenant {net:+.4f} SOL\n"
-            f"   ouvert depuis {_duree(maintenant - (p['ouvert_le'] or maintenant))} · "
-            f"sortie forcée dans {_duree(max(0, restant))}"
-        )
-    return "\n".join(lignes)
+        await _repondre(update, "📂 Aucune position simulée ouverte.")
+        return
+    await _actualiser_prix(ouverts)
+    ouverts = sorted(db.positions(), key=lambda p: (p["portefeuille"] != "moi", p["ouvert_le"] or 0))
+    r, eur = regles(), await sol_en_eur()
+    total = sum(_valeur_nette(p, p["prix_actuel"], r["frais"]) or 0 for p in ouverts)
+    await _repondre(update, f"📂 <b>{len(ouverts)} position(s) simulée(s) ouverte(s)</b>\n"
+                            f"Si tout était vendu maintenant : {_sol_eur(total, eur)}\n"
+                            "<i>Vente aussi possible avec /vendre &lt;numéro ou token&gt; &lt;pourcentage&gt;</i>")
+    for p in ouverts[:MAX_CARTES]:
+        await update.message.reply_text(texte_carte(p, eur), parse_mode=ParseMode.HTML, reply_markup=boutons_position(p),
+                                        link_preview_options=LinkPreviewOptions(is_disabled=True))
+    if len(ouverts) > MAX_CARTES:
+        reste = [f"#{p['id']} {html.escape(p['symbole'] or p['token_adresse'][:6])}" for p in ouverts[MAX_CARTES:]]
+        await _repondre(update, f"… et {len(reste)} autre(s) : {', '.join(reste)}\n"
+                                "Pour les vendre : /vendre &lt;numéro&gt; &lt;pourcentage&gt;")
+
+
+# ---------------------------------------------------------------------------
+# Vente manuelle : boutons et /vendre
+# ---------------------------------------------------------------------------
+
+async def vendre(trade_id: int, pourcentage: float) -> tuple[bool, str]:
+    """Vend `pourcentage` % d'une position au prix DexScreener du moment (moins les frais). Renvoie (réussi, message)."""
+    p = db.lire_position(trade_id)
+    if p is None:
+        return False, f"❓ Position #{trade_id} introuvable. Tape /positions pour la liste."
+    nom = html.escape(p["symbole"] or p["token_adresse"][:6])
+    if p["statut"] == "en_attente":
+        return False, f"⏳ #{trade_id} {nom} : pas encore de prix sur DexScreener, impossible de vendre pour l'instant."
+    if p["statut"] != "ouvert":
+        return False, f"ℹ️ #{trade_id} {nom} est déjà fermée ({html.escape(p['raison_sortie'] or p['statut'])})."
+    try:
+        prix = (await prix_actuels([p["token_adresse"]])).get(p["token_adresse"], (None, None))[0]
+    except Exception:
+        prix = None
+    if not prix:
+        return False, f"⚠️ Prix DexScreener indisponible pour {nom} : vente NON faite, réessaie dans un instant."
+    r = regles()
+    db.maj_prix_position(trade_id, prix)
+    resultat = db.vendre_position(trade_id, pourcentage, prix, r["frais"], int(time.time()))
+    if resultat is None:  # les règles l'ont fermée pendant qu'on cherchait le prix
+        return False, f"ℹ️ #{trade_id} {nom} vient d'être fermée par les règles : voir /journal."
+    eur = await sol_en_eur()
+    texte = (f"✋ <b>Vente manuelle de {pourcentage:g} %</b> · #{trade_id} {nom}\n"
+             f"   {resultat['vendu_sol']:.4g} SOL vendus à {_prix(prix)} (frais {r['frais']:g} % déduits)\n"
+             f"   {'🟢' if resultat['pnl_sol'] > 0 else '🔴'} <b>{resultat['pnl_pct']:+.0f} % · "
+             f"{_sol_eur(resultat['pnl_sol'], eur)}</b>")
+    texte += (f"\n   Reste en position : {resultat['reste_sol']:.4g} SOL" if resultat["reste_sol"] > 0
+              else "\n   Position fermée. Le bot suit encore le prix pour comparer avec les règles (/stats).")
+    log.info("Simulation : vente manuelle de %g %% de la position %d", pourcentage, trade_id)
+    return True, texte
+
+
+def _de_mon_chat(update: Update) -> bool:
+    message = update.callback_query.message
+    return message is not None and message.chat.id == config.TELEGRAM_CHAT_ID
+
+
+async def bouton_vendre(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Boutons « Vendre 50 % » / « Vendre 100 % » sous une position."""
+    query = update.callback_query
+    if not _de_mon_chat(update):
+        await query.answer()
+        return
+    _, trade_id, pourcentage = query.data.split(":")
+    reussi, texte = await vendre(int(trade_id), float(pourcentage))
+    await query.answer("Vente simulée faite" if reussi else "Vente non faite")
+    p = db.lire_position(int(trade_id))
+    encore_ouverte = p is not None and p["statut"] == "ouvert"
+    if encore_ouverte:
+        texte += "\n\n" + texte_carte(p, await sol_en_eur())
+    await query.edit_message_text(texte, parse_mode=ParseMode.HTML,
+                                  reply_markup=boutons_position(p) if encore_ouverte else None,
+                                  link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+async def bouton_actualiser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bouton « Actualiser » : prix DexScreener du moment, la carte est mise à jour."""
+    query = update.callback_query
+    if not _de_mon_chat(update):
+        await query.answer()
+        return
+    p = db.lire_position(int(query.data.split(":")[1]))
+    if p is None or p["statut"] not in ("ouvert", "en_attente"):
+        await query.answer("Position fermée")
+        texte = "ℹ️ Position fermée" + (f" ({html.escape(p['raison_sortie'] or '')}) : voir /journal." if p else ".")
+        await query.edit_message_text(texte, parse_mode=ParseMode.HTML)
+        return
+    await _actualiser_prix([p])
+    p = db.lire_position(p["id"])
+    await query.answer("Prix actualisé")
+    nouveau = texte_carte(p, await sol_en_eur())
+    if nouveau != query.message.text_html:  # Telegram refuse une modification identique
+        try:
+            await query.edit_message_text(nouveau, parse_mode=ParseMode.HTML, reply_markup=boutons_position(p),
+                                          link_preview_options=LinkPreviewOptions(is_disabled=True))
+        except Exception as erreur:  # « message is not modified » si rien n'a bougé
+            log.debug("Actualiser : %s", erreur)
+
+
+def trouver_positions(cle: str) -> list:
+    """Positions ouvertes qui correspondent à un numéro (#12 ou 12), un symbole ($TST ou TST) ou une adresse."""
+    ouvertes = db.positions()
+    numero = cle.lstrip("#")
+    if numero.isdigit():
+        par_numero = [p for p in ouvertes if p["id"] == int(numero)]
+        if par_numero or cle.startswith("#"):
+            return par_numero
+    symbole = cle.lstrip("$").lower()
+    return [p for p in ouvertes if p["token_adresse"] == cle or (p["symbole"] or "").lower() == symbole]
+
+
+async def cmd_vendre(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/vendre <token ou numéro> <pourcentage> — ex : /vendre 12 50, /vendre TST 100, /vendre #12 25 %"""
+    usage = ("Utilisation : /vendre &lt;numéro ou token&gt; &lt;pourcentage&gt;\n"
+             "Exemples : <code>/vendre 12 50</code> · <code>/vendre BONK 100</code>\n"
+             "Les numéros sont affichés dans /positions (#12).")
+    if len(context.args) < 2:
+        await _repondre(update, usage)
+        return
+    try:
+        pourcentage = float("".join(context.args[1:]).replace("%", "").replace(",", "."))
+    except ValueError:
+        pourcentage = 0
+    if not 0 < pourcentage <= 100:
+        await _repondre(update, "❌ Le pourcentage doit être entre 1 et 100.\n\n" + usage)
+        return
+    trouvees = trouver_positions(context.args[0])
+    if not trouvees:
+        await _repondre(update, f"❓ Aucune position ouverte pour « {html.escape(context.args[0])} ». "
+                                "Tape /positions pour la liste.")
+        return
+    if len(trouvees) > 1:
+        liste = "\n".join(f"• #{p['id']} {html.escape(p['symbole'] or '?')} · {PORTEFEUILLES.get(p['portefeuille'])}"
+                          for p in trouvees)
+        await _repondre(update, f"Plusieurs positions correspondent, précise le numéro :\n{liste}\n\n"
+                                f"Ex : <code>/vendre {trouvees[0]['id']} {pourcentage:g}</code>")
+        return
+    _, texte = await vendre(trouvees[0]["id"], pourcentage)
+    await _repondre(update, texte)
 
 
 async def _repondre(update: Update, texte: str) -> None:
@@ -470,13 +732,12 @@ async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _repondre(update, texte_journal())
 
 
-async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _repondre(update, texte_positions())
-
-
 def enregistrer_commandes(application: Application) -> None:
     moi = telegram_bot.SEULEMENT_MOI
     application.add_handler(CommandHandler("stats", cmd_stats, filters=moi))
     application.add_handler(CommandHandler("journal", cmd_journal, filters=moi))
     application.add_handler(CommandHandler("positions", cmd_positions, filters=moi))
+    application.add_handler(CommandHandler("vendre", cmd_vendre, filters=moi))
+    application.add_handler(CallbackQueryHandler(bouton_vendre, pattern=r"^sim_vendre:\d+:\d+$"))
+    application.add_handler(CallbackQueryHandler(bouton_actualiser, pattern=r"^sim_maj:\d+$"))
     application.add_handler(CallbackQueryHandler(bouton_accepter, pattern="^accepter$"))

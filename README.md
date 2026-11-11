@@ -27,7 +27,7 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 │   ├── wallets.py       # Suivi des wallets : commandes, alertes, analyse du dimanche
 │   ├── nouveaux_tokens.py # Créations pump.fun en temps réel, devs suivis, /scanall, /devscore
 │   ├── veille.py        # Veille de canaux Telegram (compte utilisateur, lecture seule), page /tglogin
-│   ├── simulation.py    # Trades simulés : « Bot seul » contre « Mes choix », /stats, /journal, /positions
+│   ├── simulation.py    # Trades simulés : « Bot seul » contre « Mes choix », /stats, /journal, /positions, /vendre
 │   ├── ia.py            # Avis IA sur les alertes (haussier, baissier, juge) et revue de la semaine
 │   ├── regles.py        # Changements acceptés de rules.json et historique des versions (/rules, /rollback)
 │   ├── supervision.py   # État de chaque module, relance automatique en cas de plantage
@@ -49,9 +49,14 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 
 ### Commandes Telegram
 
+Tape **« / »** dans la conversation avec ton bot : la liste des commandes s'affiche avec une courte
+description (le bot l'envoie à Telegram à chaque démarrage). **`/aide`** les explique toutes en
+français.
+
 | Commande  | Effet |
 |-----------|-------|
 | `/start`  | Message d'accueil et liste des commandes |
+| `/aide` (ou `/help`) | Explication de toutes les commandes |
 | `/status` | État (actif / en pause), durée en ligne, nombre de wallets/devs suivis, alertes, trades simulés |
 | `/pause`  | Met les alertes en pause (le réglage est conservé même après un redémarrage) |
 | `/resume` | Relance les alertes |
@@ -72,7 +77,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/veille` | État de la connexion du compte et nombre de messages lus depuis le démarrage |
 | `/stats` | Résultats des trades simulés : réussite, gain et perte moyens, total en SOL et en €, par type d'alerte, par wallet, et **Bot seul contre Mes choix** |
 | `/journal` | Les 10 derniers trades simulés avec leur résultat |
-| `/positions` | Les trades simulés encore ouverts |
+| `/positions` | Les trades simulés encore ouverts : prix d'achat, prix actuel, gain ou perte en %, SOL et €, avec les boutons **Vendre 50 %**, **Vendre 100 %** et **Actualiser** |
+| `/vendre <numéro ou token> <pourcentage>` | Vend (en simulation) une partie d'une position, ex : `/vendre 12 50` ou `/vendre BONK 100` |
 | `/revue` | Lance tout de suite la revue IA de la semaine (propositions à accepter ou refuser) |
 | `/rules` | Historique des versions des règles (`/rules <n>` : détail d'une version) |
 | `/rollback [n]` | Revient à la version `n` des règles (sans numéro : à la version précédente) |
@@ -214,7 +220,39 @@ fait le prix après l'alerte, et combien ont fait les alertes que tu as ignorée
 **`/stats`** compare côte à côte Bot seul et Mes choix (trades terminés, en cours, réussite, gain
 moyen, perte moyenne, résultat en SOL et en euros), puis détaille par type d'alerte (wallet,
 signal fort, dev, scanall, canal) et par wallet suivi. **`/journal`** montre les 10 derniers trades
-terminés, **`/positions`** ceux encore ouverts (avec leur résultat s'ils étaient vendus maintenant).
+terminés, **`/positions`** ceux encore ouverts.
+
+### Vendre toi-même une position simulée
+
+**`/positions`** envoie un message par position ouverte (les 15 premières ; « Mes choix » d'abord),
+avec son numéro (`#12`), le prix d'achat, le prix actuel et le gain ou la perte **si tu vendais
+maintenant**, en %, en SOL et en euros (frais compris). Sous chaque position :
+
+| Bouton | Effet |
+|--------|-------|
+| 💸 Vendre 50 % | vend la moitié de ce qui reste dans la position |
+| 💸 Vendre 100 % | vend tout ce qui reste : la position est fermée |
+| 🔄 Actualiser | relit le prix sur DexScreener et met le message à jour |
+
+Sans les boutons : **`/vendre <numéro ou token> <pourcentage>`** (ex : `/vendre 12 50`,
+`/vendre #12 25 %`, `/vendre BONK 100`). Si plusieurs positions ont le même token (Bot seul et Mes
+choix), le bot te demande le numéro.
+
+- La vente se fait au **prix DexScreener du moment moins 2 % de frais** (le réglage
+  `frais_glissement_pct` de rules.json). Si DexScreener ne donne pas de prix, la vente n'est pas
+  faite (réessaie un peu plus tard).
+- Elle apparaît dans **`/journal`** avec la mention **« ✋ vente manuelle (50 %) »**. Une vente
+  partielle compte comme un trade à part ; le reste de la position continue avec les règles
+  habituelles (+100 %, -40 %, 24 h).
+- **Est-ce que tes interventions font mieux que les règles ?** Après une vente manuelle, le bot
+  continue de suivre le prix de ce token et calcule ce que les règles auraient donné (au moment où
+  elles auraient vendu). **`/stats`** affiche alors une section *⚙️ Ventes automatiques contre ✋
+  ventes manuelles* : réussite et résultat de chaque type de vente, puis la comparaison sur les
+  mêmes trades : « si tu avais laissé faire les règles : X SOL au lieu de Y SOL ». Le journal montre
+  aussi, à côté de chaque vente manuelle, le résultat qu'auraient eu les règles.
+- Tu peux vendre des positions des deux portefeuilles. Attention : une vente manuelle dans
+  « Bot seul » veut dire que ce n'est plus tout à fait le bot seul. Pour comparer proprement, vends
+  plutôt tes positions « Mes choix ».
 
 Bon à savoir :
 - Le prix d'entrée est le prix du marché au moment de l'alerte (ou du clic), plus les frais. Un
