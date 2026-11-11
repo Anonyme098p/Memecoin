@@ -52,11 +52,10 @@ def _corps_webhook(url_reception: str, adresses: list[str]) -> dict:
         "webhookURL": url_reception,
         "webhookType": "enhanced",
         "accountAddresses": adresses,
-        # Liste vide = tous les types de transactions. On filtre nous-mêmes les achats,
-        # car selon la plateforme (Jupiter, Raydium, pump.fun...) le type peut être SWAP, BUY...
-        "transactionTypes": [],
+        # Obligatoire (au moins un type). "ANY" par défaut : voir config.HELIUS_TRANSACTION_TYPES
+        "transactionTypes": config.HELIUS_TRANSACTION_TYPES,
         # Helius recopiera cette valeur dans l'en-tête "Authorization" de chaque requête
-        "authHeader": config.WEBHOOK_SECRET,
+        "authHeader": config.HELIUS_WEBHOOK_SECRET,
     }
 
 
@@ -79,6 +78,12 @@ async def modifier_webhook(webhook_id: str, url_reception: str, adresses: list[s
         return None
     _verifier(reponse)
     return reponse.json()
+
+
+async def activer_webhook(webhook_id: str) -> None:
+    """Réactive un webhook que Helius a désactivé (ex : trop d'erreurs de notre côté)."""
+    reponse = await _requete("PATCH", f"{URL_WEBHOOKS}/{webhook_id}", {"active": True})
+    _verifier(reponse)
 
 
 async def supprimer_webhook(webhook_id: str) -> None:

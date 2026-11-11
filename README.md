@@ -42,6 +42,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/addwallet <adresse> <surnom>` | Suit un wallet (le surnom peut contenir des espaces). Le webhook Helius est mis à jour tout seul |
 | `/removewallet <adresse>` | Arrête de suivre un wallet (et met à jour le webhook Helius) |
 | `/wallets` | Liste des wallets suivis |
+| `/webhook` | État du webhook Helius : URL, type, transactions, actif ou non, adresses synchronisées, secret identique, dernière réception |
+| `/webhook sync` | Force la resynchronisation du webhook Helius, puis affiche son état |
 
 🔒 Le bot **ne répond qu'à ton chat** (`TELEGRAM_CHAT_ID`). Les autres personnes sont ignorées.
 
@@ -65,7 +67,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `HELIUS_API_KEY`          | ✅ | Clé API Helius |
 | `DB_PATH`                 | ✅ sur Railway | Chemin du fichier SQLite. Sur Railway : `/data/bot.db` |
 | `PUBLIC_URL`              | ✅ pour les alertes | Ton domaine Railway, ex : `https://mon-bot.up.railway.app`. Si absent, le bot utilise `RAILWAY_PUBLIC_DOMAIN` (rempli par Railway) |
-| `WEBHOOK_SECRET`          | ❌ | Secret que Helius doit envoyer dans l'en-tête `Authorization`. Si absent, il est calculé automatiquement à partir de ta clé Helius |
+| `HELIUS_WEBHOOK_SECRET`   | ✅ pour les alertes | Secret que Helius envoie dans l'en-tête `Authorization` de chaque requête. Sans lui, le webhook n'est pas créé et `/helius` refuse tout |
+| `HELIUS_TRANSACTION_TYPES`| ❌ | Types de transactions envoyés par Helius, séparés par des virgules (défaut : `ANY`). Voir plus bas |
 | `SIGNAL_FORT_MIN_WALLETS` | ❌ | Nombre de wallets pour un SIGNAL FORT (défaut : 2) |
 | `SIGNAL_FORT_MINUTES`     | ❌ | Fenêtre de temps du SIGNAL FORT, en minutes (défaut : 10) |
 | `INTERVALLE_SURVEILLANCE` | ❌ | Secondes entre deux tours de surveillance (défaut : 60) |
@@ -165,9 +168,14 @@ Sans volume, le fichier SQLite est **effacé à chaque redéploiement**.
    TELEGRAM_CHAT_ID=ton_id_telegram
    HELIUS_API_KEY=ta_cle_helius
    DB_PATH=/data/bot.db
+   HELIUS_WEBHOOK_SECRET=une_longue_phrase_secrete
    ```
 
    ⚠️ `DB_PATH` doit commencer par le *Mount path* du volume (`/data`).
+
+   Pour `HELIUS_WEBHOOK_SECRET`, invente une longue suite de caractères (au moins 30), ou
+   génère-la avec : `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+   Ne la partage avec personne : elle prouve que les requêtes reçues viennent bien de Helius.
 3. Clique sur **Deploy** (ou **Apply changes**) : Railway redéploie automatiquement.
 
 ### Étape 8 — Vérifier que tout marche
@@ -195,9 +203,27 @@ Helius a besoin d'une adresse publique pour envoyer les transactions à ton bot 
    ```
 4. Test : ouvre `https://mon-bot.up.railway.app/health` dans ton navigateur → `{"statut":"ok",...}`.
 
-**Tu n'as rien à configurer chez Helius** : le bot crée lui-même le webhook (pointant vers
-`https://mon-bot.up.railway.app/helius`, avec le secret d'authentification) dès que tu ajoutes
-un premier wallet. Tu peux le voir sur [dashboard.helius.dev/webhooks](https://dashboard.helius.dev/webhooks).
+**Tu n'as rien à configurer chez Helius** : le bot crée lui-même le webhook dès que tu ajoutes
+un premier wallet, avec cette configuration :
+
+| Champ | Valeur |
+|-------|--------|
+| `webhookURL` | `PUBLIC_URL` + `/helius` |
+| `webhookType` | `enhanced` |
+| `transactionTypes` | `HELIUS_TRANSACTION_TYPES` (par défaut `["ANY"]`) |
+| `accountAddresses` | tous les wallets suivis |
+| `authHeader` | `HELIUS_WEBHOOK_SECRET` |
+
+À chaque démarrage, le bot cherche s'il existe déjà un webhook pour cette URL : si oui, il le
+**met à jour** (il n'en crée jamais un second, et supprime les doublons éventuels). Tu peux le
+voir sur [dashboard.helius.dev/webhooks](https://dashboard.helius.dev/webhooks) ou avec `/webhook`.
+
+**Pourquoi `ANY` et pas `SWAP` ?** Helius ne classe pas les achats pump.fun en `SWAP` : sur
+PumpSwap ils sont classés `BUY`, et sur la courbe de lancement pump.fun ils sont souvent
+`UNKNOWN`. Avec `SWAP` seul, ces achats ne seraient jamais reçus. Le bot reçoit donc toutes les
+transactions de tes wallets et trie lui-même les achats. Chaque transaction reçue coûte 1 crédit
+Helius : pour en économiser (en perdant les achats sur la courbe pump.fun), tu peux mettre
+`HELIUS_TRANSACTION_TYPES=SWAP,BUY`.
 
 ### Étape 10 — Ajouter tes premiers wallets
 
@@ -208,7 +234,8 @@ Sur Telegram, envoie à ton bot :
 ```
 
 Le bot répond « ✅ Wallet ajouté » puis « 🔔 Webhook Helius à jour ». Tape `/wallets` pour
-voir la liste. Si tu vois « ⚠️ PUBLIC_URL est vide », reviens à l'étape 9.
+voir la liste, et `/webhook` pour vérifier que tout est ✅. Si tu vois « ⚠️ PUBLIC_URL est
+vide » ou « HELIUS_WEBHOOK_SECRET est vide », ajoute la variable sur Railway (étapes 7 et 9).
 
 ### Mettre à jour le bot
 
@@ -256,9 +283,11 @@ instance** (replica) sur Railway.
 | Les données disparaissent après un redéploiement | Le volume n'est pas monté, ou `DB_PATH` ne commence pas par `/data` |
 | `Conflict: terminated by other getUpdates request` | Le bot tourne à deux endroits en même temps (local + Railway, ou 2 replicas) |
 | `⚠️ Webhook Helius NON mis à jour : la variable PUBLIC_URL est vide` | Génère un domaine Railway et ajoute `PUBLIC_URL` (étape 9) |
+| `⚠️ ... HELIUS_WEBHOOK_SECRET est vide` | Ajoute la variable `HELIUS_WEBHOOK_SECRET` (étape 7) |
+| `❌ Erreur Helius ... 400 ... transaction type` | Vérifie `HELIUS_TRANSACTION_TYPES` (ex : `ANY` ou `SWAP,BUY`), puis `/webhook sync` |
 | `❌ Erreur Helius ... 401` | `HELIUS_API_KEY` est fausse |
 | `❌ Erreur Helius ... 429` ou limite de webhooks | Trop de requêtes, ou trop de webhooks sur ton compte Helius (5 en gratuit) : supprime les anciens sur le dashboard Helius |
-| Wallet ajouté mais aucune alerte | Vérifie dans les logs Railway la ligne `Webhook Helius reçu`. Si elle n'apparaît jamais, regarde les logs du webhook sur le dashboard Helius. Si tu vois `Requête refusée sur /helius`, renvoie `/addwallet` sur un wallet existant pour resynchroniser le secret |
+| Wallet ajouté mais aucune alerte | Vérifie dans les logs Railway la ligne `Webhook Helius reçu`. Si elle n'apparaît jamais, regarde les logs du webhook sur le dashboard Helius. Tape `/webhook` : tout doit être ✅. Si tu vois `Requête refusée sur /helius` dans les logs, le secret chez Helius est différent : tape `/webhook sync` |
 
 ---
 

@@ -5,8 +5,6 @@ Aucune clé secrète n'est écrite dans le code : tout vient de l'environnement
 (onglet "Variables" sur Railway, ou fichier .env en local).
 """
 
-import hashlib
-import hmac
 import os
 import sys
 
@@ -73,13 +71,19 @@ def _url_publique() -> str:
 
 PUBLIC_URL: str = _url_publique()
 
-# Secret que Helius met dans l'en-tête "Authorization" de chaque requête :
-# il prouve que la requête vient bien de Helius.
-# Si tu ne le définis pas, il est calculé à partir de ta clé Helius
-# (il reste donc secret et identique d'un redémarrage à l'autre).
-WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "").strip() or hmac.new(
-    HELIUS_API_KEY.encode(), b"webhook-helius", hashlib.sha256
-).hexdigest()
+# Secret que Helius recopie dans l'en-tête "Authorization" de chaque requête
+# envoyée sur /helius : il prouve que la requête vient bien de Helius.
+# Sans lui, le webhook n'est pas créé et toutes les requêtes sur /helius sont refusées.
+# Pour en générer un : python -c "import secrets; print(secrets.token_urlsafe(32))"
+HELIUS_WEBHOOK_SECRET: str = os.getenv("HELIUS_WEBHOOK_SECRET", "").strip()
+
+# Types de transactions que Helius doit nous envoyer (séparés par des virgules).
+# Par défaut "ANY" (toutes) : les achats pump.fun ne sont PAS classés "SWAP" par Helius
+# (PumpSwap = "BUY", courbe pump.fun = souvent "UNKNOWN"). Le bot trie lui-même les achats.
+# Pour économiser des crédits Helius, tu peux mettre par exemple : SWAP,BUY
+HELIUS_TRANSACTION_TYPES: list[str] = [
+    t.strip().upper() for t in os.getenv("HELIUS_TRANSACTION_TYPES", "ANY").split(",") if t.strip()
+] or ["ANY"]
 
 # --- Signal fort ---
 # Si au moins SIGNAL_FORT_MIN_WALLETS wallets suivis achètent le même token
