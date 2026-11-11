@@ -406,7 +406,8 @@ async def _envoyer(application: Application, type_alerte: str, texte: str, creat
         signature=creation.get("signature"), prix_usd=a.donnees.prix_usd if a else None,
         telegram_message_id=message.message_id, note_token=a.note if a else None, danger=a.danger if a else None,
     )
-    wallets._simuler(alerte_id, type_alerte, creation["mint"], creation.get("symbol"), createur, a)
+    wallets._simuler(alerte_id, type_alerte, creation["mint"], creation.get("symbol"), createur, a,
+                     application, message.message_id, texte)
 
 
 async def alerte_dev_suivi(application: Application, creation: dict, dev) -> None:

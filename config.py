@@ -171,6 +171,16 @@ VEILLE_FENETRE_MIN: int = _entier("VEILLE_FENETRE_MIN", 30)
 # Fréquence de lecture des canaux publics dont le compte n'est pas membre (secondes)
 VEILLE_RELECTURE_S: int = _entier("VEILLE_RELECTURE_S", 60)
 
+# --- IA (modules/ia.py) : Grok (xAI) ou Claude (Anthropic), selon la clé présente ---
+XAI_API_KEY: str = _brut("XAI_API_KEY")
+ANTHROPIC_API_KEY: str = _brut("ANTHROPIC_API_KEY")
+# Pour choisir quand les deux clés sont présentes : "grok" ou "claude" (par défaut : grok)
+IA_FOURNISSEUR: str = _texte("IA_FOURNISSEUR", "").lower()
+# Modèle utilisé (par défaut : grok-4.7 pour Grok, claude-opus-5-5 pour Claude)
+IA_MODELE: str = _brut("IA_MODELE")
+# Nombre maximum d'appels à l'IA par jour (chaque alerte en coûte 3 : haussier, baissier, juge)
+IA_MAX_PAR_JOUR: int = _entier("IA_MAX_PAR_JOUR", 200)
+
 # --- Divers ---
 # Intervalle (en secondes) entre deux tours de la boucle de surveillance
 INTERVALLE_SURVEILLANCE: int = _entier("INTERVALLE_SURVEILLANCE", 60)

@@ -18,6 +18,9 @@ Tables :
   - trades_simules   : les trades simulés (portefeuilles « Bot seul » et « Mes choix », modules/simulation.py)
   - suivi_alertes    : prix de chaque alerte au signal, à 5 min, 1 h et 24 h
   - decisions        : chaque clic Accepter / Ignorer, avec l'heure
+  - appels_ia        : chaque appel à l'IA (pour la limite par jour, modules/ia.py)
+  - propositions_ia  : changements proposés par la revue IA (en attente / acceptés / refusés)
+  - versions_regles  : historique des versions des règles (pour /rules et /rollback)
   - parametres       : petits réglages clé/valeur (ex : bot en pause ou non)
 """
 
@@ -158,6 +161,39 @@ CREATE TABLE IF NOT EXISTS decisions (
     date       TEXT NOT NULL               -- heure du clic (UTC)
 );
 
+-- IA : appels (limite par jour), propositions de la revue, versions des règles
+CREATE TABLE IF NOT EXISTS appels_ia (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    jour    TEXT NOT NULL,              -- AAAA-MM-JJ (fuseau FUSEAU_HORAIRE)
+    quand   TEXT NOT NULL,
+    usage   TEXT NOT NULL,              -- haussier, baissier, juge, revue
+    ok      INTEGER NOT NULL,
+    erreur  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS propositions_ia (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    sorte            TEXT NOT NULL,     -- 'regle' ou 'wallet'
+    chemin           TEXT,              -- règle : ex simulation.stop_loss_pct
+    adresse          TEXT,              -- wallet à retirer
+    ancienne_valeur  TEXT,              -- JSON
+    nouvelle_valeur  TEXT,              -- JSON
+    raison           TEXT,
+    statut           TEXT NOT NULL DEFAULT 'en_attente',  -- en_attente, acceptee, refusee, obsolete
+    cree_le          TEXT NOT NULL,
+    decide_le        TEXT,
+    telegram_message_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS versions_regles (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    date         TEXT NOT NULL,
+    source       TEXT NOT NULL,         -- départ, revue IA, retour arrière...
+    description  TEXT,
+    surcharges   TEXT NOT NULL,         -- JSON {chemin: valeur} appliqué par-dessus rules.json
+    regles       TEXT NOT NULL          -- JSON des règles effectives à ce moment
+);
+
 CREATE TABLE IF NOT EXISTS parametres (
     cle     TEXT PRIMARY KEY,
     valeur  TEXT NOT NULL
@@ -217,6 +253,8 @@ COLONNES_AJOUTEES = {
         "prix_usd": "REAL",
         "telegram_message_id": "INTEGER",
         "statut": "TEXT NOT NULL DEFAULT 'envoyee'",
+        "ia_verdict": "TEXT",       # ACHETER / ATTENDRE / IGNORER (modules/ia.py)
+        "ia_explication": "TEXT",
         "note_token": "INTEGER",    # note du token (0 à 100) au moment de l'alerte
         "danger": "INTEGER",        # 1 si le token était marqué DANGER
     },
@@ -743,6 +781,74 @@ def trades_fermes(portefeuille: str | None = None, limite: int | None = None) ->
 def suivis_alertes() -> list[sqlite3.Row]:
     with connexion() as conn:
         return conn.execute("SELECT * FROM suivi_alertes").fetchall()
+
+
+# ---------------------------------------------------------------------------
+# IA (modules/ia.py et modules/regles.py)
+# ---------------------------------------------------------------------------
+
+def enregistrer_appel_ia(jour: str, usage: str, ok: bool, erreur: str | None = None) -> None:
+    with connexion() as conn:
+        conn.execute("INSERT INTO appels_ia (jour, quand, usage, ok, erreur) VALUES (?, ?, ?, ?, ?)",
+                     (jour, maintenant(), usage, int(ok), erreur))
+
+
+def compter_appels_ia(jour: str) -> int:
+    with connexion() as conn:
+        return conn.execute("SELECT COUNT(*) FROM appels_ia WHERE jour = ?", (jour,)).fetchone()[0]
+
+
+def maj_verdict_ia(alerte_id: int, verdict: str, explication: str) -> None:
+    with connexion() as conn:
+        conn.execute("UPDATE alertes_envoyees SET ia_verdict = ?, ia_explication = ? WHERE id = ?",
+                     (verdict, explication, alerte_id))
+
+
+def lire_alerte(alerte_id: int) -> sqlite3.Row | None:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM alertes_envoyees WHERE id = ?", (alerte_id,)).fetchone()
+
+
+def creer_proposition(sorte: str, chemin: str | None, adresse: str | None, ancienne: str | None,
+                      nouvelle: str | None, raison: str) -> int:
+    with connexion() as conn:
+        return conn.execute(
+            "INSERT INTO propositions_ia (sorte, chemin, adresse, ancienne_valeur, nouvelle_valeur, raison, cree_le) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)", (sorte, chemin, adresse, ancienne, nouvelle, raison, maintenant()),
+        ).lastrowid
+
+
+def lire_proposition(proposition_id: int) -> sqlite3.Row | None:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM propositions_ia WHERE id = ?", (proposition_id,)).fetchone()
+
+
+def maj_proposition(proposition_id: int, statut: str | None = None, telegram_message_id: int | None = None) -> None:
+    with connexion() as conn:
+        if statut:
+            conn.execute("UPDATE propositions_ia SET statut = ?, decide_le = ? WHERE id = ?",
+                         (statut, maintenant(), proposition_id))
+        if telegram_message_id:
+            conn.execute("UPDATE propositions_ia SET telegram_message_id = ? WHERE id = ?",
+                         (telegram_message_id, proposition_id))
+
+
+def ajouter_version_regles(source: str, description: str, surcharges: str, regles: str) -> int:
+    with connexion() as conn:
+        return conn.execute(
+            "INSERT INTO versions_regles (date, source, description, surcharges, regles) VALUES (?, ?, ?, ?, ?)",
+            (maintenant(), source, description, surcharges, regles),
+        ).lastrowid
+
+
+def versions_regles(limite: int = 10) -> list[sqlite3.Row]:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM versions_regles ORDER BY id DESC LIMIT ?", (limite,)).fetchall()
+
+
+def lire_version_regles(version_id: int) -> sqlite3.Row | None:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM versions_regles WHERE id = ?", (version_id,)).fetchone()
 
 
 # ---------------------------------------------------------------------------

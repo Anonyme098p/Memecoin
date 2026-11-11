@@ -28,6 +28,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 │   ├── nouveaux_tokens.py # Créations pump.fun en temps réel, devs suivis, /scanall, /devscore
 │   ├── veille.py        # Veille de canaux Telegram (compte utilisateur, lecture seule), page /tglogin
 │   ├── simulation.py    # Trades simulés : « Bot seul » contre « Mes choix », /stats, /journal, /positions
+│   ├── ia.py            # Avis IA sur les alertes (haussier, baissier, juge) et revue de la semaine
+│   ├── regles.py        # Changements acceptés de rules.json et historique des versions (/rules, /rollback)
 │   ├── supervision.py   # État de chaque module, relance automatique en cas de plantage
 │   ├── analyse.py       # Note de sécurité d'un token (0 à 100), règles dans rules.json
 │   ├── analyse_wallet.py # Analyse d'historique d'un wallet : trades, statistiques, risques, note
@@ -71,6 +73,9 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/stats` | Résultats des trades simulés : réussite, gain et perte moyens, total en SOL et en €, par type d'alerte, par wallet, et **Bot seul contre Mes choix** |
 | `/journal` | Les 10 derniers trades simulés avec leur résultat |
 | `/positions` | Les trades simulés encore ouverts |
+| `/revue` | Lance tout de suite la revue IA de la semaine (propositions à accepter ou refuser) |
+| `/rules` | Historique des versions des règles (`/rules <n>` : détail d'une version) |
+| `/rollback [n]` | Revient à la version `n` des règles (sans numéro : à la version précédente) |
 | `/debugtx <adresse>` | Montre comment les 5 dernières transactions du wallet ont été comprises (achat, vente ou ignorée, et pourquoi) |
 | `/webhook` | État du webhook Helius : URL, type, transactions, actif ou non, adresses synchronisées, secret identique, dernière réception |
 | `/webhook sync` | Force la resynchronisation du webhook Helius, puis affiche son état |
@@ -93,6 +98,9 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `trades_simules`   | Trades simulés des deux portefeuilles : prix d'entrée et de sortie, résultat, raison de sortie |
 | `suivi_alertes`    | Prix de chaque alerte au signal, à 5 min, 1 h et 24 h, et ta décision |
 | `decisions`        | Chaque clic ✅ Accepter / 🙈 Ignorer, avec l'heure |
+| `appels_ia`        | Chaque appel à l'IA (pour la limite par jour) |
+| `propositions_ia`  | Propositions de la revue IA et ta décision |
+| `versions_regles`  | Toutes les versions des règles (pour revenir en arrière) |
 | `parametres`       | Petits réglages (ex : pause on/off) |
 
 ### Variables d'environnement
@@ -120,6 +128,11 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `TGLOGIN_PASSWORD`        | ❌ (veille) | Mot de passe de la page `/tglogin` (12 caractères minimum). Sert aussi à chiffrer la session : le changer oblige à se reconnecter |
 | `VEILLE_MIN_CANAUX` / `VEILLE_FENETRE_MIN` | ❌ | Alerte si un token est cité dans au moins 2 canaux en 30 minutes (défauts) |
 | `VEILLE_RELECTURE_S`      | ❌ | Relecture des canaux publics non rejoints (défaut : 60 s) |
+| `XAI_API_KEY`             | ❌ (IA) | Clé de l'API Grok (console.x.ai) |
+| `ANTHROPIC_API_KEY`       | ❌ (IA) | Clé de l'API Claude (platform.claude.com) |
+| `IA_FOURNISSEUR`          | ❌ | `grok` ou `claude`, si les deux clés sont présentes (défaut : `grok`) |
+| `IA_MODELE`               | ❌ | Modèle utilisé (défaut : `grok-4.7` ou `claude-opus-5-5`) |
+| `IA_MAX_PAR_JOUR`         | ❌ | Appels à l'IA par jour au maximum (défaut : 200 ; chaque alerte en coûte 3) |
 | `PUMPPORTAL_WS_URL`       | ❌ | Adresse du flux temps réel (défaut : PumpPortal) |
 | `RULES_PATH`              | ❌ | Chemin du fichier de règles de la note des tokens (défaut : `rules.json` du projet) |
 | `ANALYSE_TOKEN_CACHE_S`   | ❌ | Secondes pendant lesquelles l'analyse d'un token est réutilisée (défaut : 120) |
@@ -213,6 +226,76 @@ Bon à savoir :
 - Une alerte sur le même token deux fois (ex : puis en SIGNAL FORT) donne deux trades simulés.
 - Tout est dans la base du Volume : les positions ouvertes reprennent après un redémarrage. Si le
   bot était éteint au moment d'un relevé de prix (5 min, 1 h, 24 h), ce relevé reste vide.
+
+---
+
+## 🤖 L'IA : avis sur les alertes et revue de la semaine
+
+Facultatif. Ajoute **une** de ces variables sur Railway :
+- `XAI_API_KEY` pour **Grok** (clé créée sur console.x.ai), modèle `grok-4.7` ;
+- `ANTHROPIC_API_KEY` pour **Claude** (clé créée sur platform.claude.com), modèle `claude-opus-5-5`.
+
+Si les deux sont présentes, Grok est utilisé (mets `IA_FOURNISSEUR=claude` pour choisir Claude).
+`IA_MODELE` permet de changer de modèle. Sans clé, le module est simplement désactivé.
+
+### Avis sur chaque alerte
+
+Pour chaque alerte dont la note du token atteint `/minscore`, l'IA joue trois rôles :
+1. un **analyste haussier** donne ses meilleurs arguments pour acheter ;
+2. un **analyste baissier**, en même temps et sans voir le premier, donne ses arguments contre ;
+3. un **juge** lit les deux et conclut **🟢 ACHETER / 🟡 ATTENDRE / 🔴 IGNORER**, en une phrase.
+
+L'alerte part tout de suite, sans attendre l'IA ; le verdict y est ajouté dès qu'il arrive
+(quelques secondes à quelques dizaines de secondes) :
+
+```
+🤖 Avis IA : 🟡 ATTENDRE — Intéressant mais liquidité trop faible pour entrer maintenant.
+🐂 Volume 1 h solide, holders répartis. (6/10)
+🐻 Liquidité de 5 k$ seulement. (7/10)
+```
+
+Si tu as déjà appuyé sur Accepter ou Ignorer, l'avis arrive en réponse sous l'alerte. Le verdict
+est enregistré avec l'alerte. Si l'IA ne répond pas, l'alerte affiche « Avis IA indisponible ».
+
+### Revue de la semaine
+
+Chaque **dimanche** (une heure après l'analyse des wallets, donc vers 11 h par défaut), ou à tout
+moment avec **`/revue`**, l'IA reçoit les résultats des 7 derniers jours (trades simulés Bot seul
+et Mes choix, par type d'alerte, par wallet, prix après les alertes, tes décisions) et les règles
+actuelles. Elle propose des **changements de `rules.json`** et des **wallets à retirer**.
+
+**Rien n'est appliqué automatiquement.** Chaque proposition arrive dans un message à part, avec
+**✅ Accepter / ❌ Refuser**. Avant de te les montrer, le bot écarte celles qui sont
+inapplicables (règle qui n'existe pas, valeur du mauvais genre, wallet que tu ne suis pas). Une
+proposition dont la règle a changé entre-temps n'est pas appliquée.
+
+### Versions des règles : `/rules` et `/rollback`
+
+Les règles acceptées sont enregistrées **dans la base, sur le Volume** (un fichier du dossier du
+code serait effacé à chaque déploiement Railway), par-dessus le `rules.json` du projet. Chaque
+changement crée une version numérotée :
+- `/rules` liste les dernières versions et ce qui a changé ; `/rules 3` détaille la version 3 ;
+- `/rollback 3` remet les règles comme dans la version 3 ; `/rollback` seul revient à la version
+  précédente. Un retour en arrière est lui-même une version : on peut toujours l'annuler.
+
+Tu peux toujours modifier `rules.json` dans le projet : tes modifications s'appliquent, sauf sur
+les réglages que tu as changés via une proposition acceptée (ceux-là restent ceux de la base,
+jusqu'à un `/rollback`).
+
+### Coûts et sécurité
+
+- **Limite :** `IA_MAX_PAR_JOUR` appels par jour (200 par défaut). Une alerte en coûte 3, une
+  revue 1. Quand la limite est atteinte, tu es prévenu une fois et les alertes continuent sans avis
+  jusqu'au lendemain (minuit, fuseau `FUSEAU_HORAIRE`). Le compteur est visible dans `/status`.
+- **Coût indicatif :** chaque appel envoie l'alerte et son analyse (quelques milliers de tokens).
+  Surveille ta consommation sur la console de ton fournisseur et baisse `IA_MAX_PAR_JOUR` au besoin.
+- Les noms de tokens et les messages des canaux sont écrits par des inconnus : l'IA a pour consigne
+  de les traiter comme de simples données, jamais comme des instructions, et ses réponses sont
+  vérifiées avant de t'être proposées. Garde quand même un œil critique : un avis de l'IA n'est pas
+  un conseil financier.
+- Avec Claude, si le modèle refuse une demande, l'API la relance automatiquement sur un autre
+  modèle (repli côté serveur activé par défaut). Avec Grok, les conversations ne sont pas
+  conservées chez xAI (`store: false`).
 
 ---
 

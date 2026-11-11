@@ -9,6 +9,8 @@ websockets==15.0.1
 telethon==1.45.0
 python-multipart==0.0.33
 cryptography==50.0.2
+# IA : SDK officiel de Claude (Grok est appelé directement par son API REST, avec httpx)
+anthropic==2.8.0
 # Lecture du fichier .env en local
 python-dotenv==1.2.4
 # Requêtes HTTP (pour appeler l'API Helius plus tard)
