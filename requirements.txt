@@ -1,0 +1,9 @@
+# Bot Telegram
+python-telegram-bot==22.8
+# Serveur web
+fastapi==0.162.4
+uvicorn==0.54.0
+# Lecture du fichier .env en local
+python-dotenv==1.2.4
+# Requêtes HTTP (pour appeler l'API Helius plus tard)
+httpx==0.28.1
