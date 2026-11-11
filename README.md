@@ -522,13 +522,41 @@ Sans volume, le fichier SQLite est **effacé à chaque redéploiement**.
 Helius a besoin d'une adresse publique pour envoyer les transactions à ton bot :
 
 1. Clique sur ton service → onglet **Settings** → section **Networking** → **Generate Domain**.
-   Si Railway demande un port, laisse celui proposé (le bot écoute sur la variable `PORT`).
 2. Tu obtiens une adresse du type `https://mon-bot.up.railway.app`.
 3. Dans l'onglet **Variables**, ajoute :
    ```
    PUBLIC_URL=https://mon-bot.up.railway.app
    ```
-4. Test : ouvre `https://mon-bot.up.railway.app/health` dans ton navigateur → `{"statut":"ok",...}`.
+4. Test : ouvre `https://mon-bot.up.railway.app/` dans ton navigateur → `Blot-nsm en ligne`.
+   Puis `https://mon-bot.up.railway.app/health` → l'état de chaque module (voir plus bas).
+
+#### Le « target port » (Settings → Networking)
+
+Railway reçoit les visiteurs sur l'adresse publique et les envoie vers **un port** de ton
+application : c'est le *target port*, affiché à côté du domaine (« → Port 8080 » par exemple).
+Le bot, lui, écoute sur le port donné par la variable `PORT`, que Railway fournit tout seul.
+**Les deux doivent être identiques**, sinon l'adresse publique affiche « Application failed to
+respond » alors que le déploiement est vert.
+
+Pour vérifier :
+1. Onglet **Deployments** → dernier déploiement → **Deploy Logs**. Cherche la ligne
+   `Serveur web en écoute sur 0.0.0.0:XXXX` (ou `Uvicorn running on http://0.0.0.0:XXXX`).
+2. **Settings** → **Networking** → le domaine public : le port affiché doit être ce même `XXXX`.
+   Sinon, clique sur le domaine (icône crayon) et mets ce numéro comme port.
+3. N'ajoute **pas** toi-même de variable `PORT` dans l'onglet Variables, sauf pour forcer une
+   valeur précise : dans ce cas, mets exactement le même numéro comme *target port*.
+
+Le serveur web ouvre son port **dès le lancement**, avant même que le bot Telegram soit connecté :
+l'adresse publique répond donc tout de suite, même si Telegram ou Helius sont lents.
+
+#### La page `/health`
+
+Elle répond toujours (code 200) tant que le serveur tourne : c'est ce que Railway vérifie après
+chaque déploiement. Le champ `statut` vaut `ok`, ou `degrade` si un module a un problème, et
+`modules` détaille chacun : serveur web, base de données, bot Telegram (avec l'erreur s'il ne
+démarre pas), alertes (pause, `/minscore`), webhook Helius, flux pump.fun et `/scanall`, veille
+Telegram, et l'état de chaque tâche de fond (`en cours`, `arrêtée`, `plantée (...)`). Elle est
+publique mais ne montre que des états et des compteurs, aucun secret.
 
 **Tu n'as rien à configurer chez Helius** : le bot crée lui-même le webhook dès que tu ajoutes
 un premier wallet, avec cette configuration :
@@ -604,6 +632,9 @@ instance** (replica) sur Railway.
 
 | Symptôme | Solution |
 |----------|----------|
+| L'adresse publique affiche « Application failed to respond » alors que le déploiement est vert | Le *target port* du domaine ne correspond pas au port d'écoute : voir « Le target port » à l'étape 9 |
+| `/health` : `bot_telegram` en `erreur` « TELEGRAM_TOKEN refusé » | Le token est faux : recopie-le depuis @BotFather (le serveur web, lui, reste en ligne) |
+| `/health` : `bot_telegram` en `nouvel essai` | Telegram injoignable pour l'instant : le bot réessaie tout seul (5 s, 10 s, 20 s... jusqu'à 5 min) |
 | `ERREUR : la variable d'environnement ... est manquante` | Ajoute la variable dans l'onglet *Variables* de Railway |
 | `The token ... was rejected by the server` | Le `TELEGRAM_TOKEN` est faux : recopie-le depuis @BotFather |
 | Pas de message « 🚀 Bot démarré » | Vérifie `TELEGRAM_CHAT_ID` et que tu as bien appuyé sur *Démarrer* dans la conversation avec ton bot |
