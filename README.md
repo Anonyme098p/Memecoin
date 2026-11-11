@@ -628,10 +628,32 @@ instance** (replica) sur Railway.
 
 ---
 
+## 🛡️ Le bot ne plante jamais en entier
+
+Chaque partie du bot (« module ») tourne isolée. Si l'une a un problème, **seule elle s'arrête** :
+les autres continuent, et le serveur web répond toujours.
+
+| Situation | Ce qui se passe |
+|-----------|-----------------|
+| Variable obligatoire manquante (`TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `HELIUS_API_KEY`) | Le module qui en a besoin est désactivé (sans Telegram, le bot ne peut rien envoyer, mais `/health` explique pourquoi) |
+| Variable mal écrite (`ANALYSE_JOURS=trente`, `"1234567"` entre guillemets, `10,5`...) | Les espaces et guillemets sont retirés ; une valeur invalide est remplacée par sa valeur par défaut et signalée |
+| Veille Telegram non configurée ou non connectée | Veille désactivée ou « en attente », le reste tourne |
+| Bibliothèque absente, module qui ne se charge pas | Ce module est désactivé ; ses commandes répondent « Commande indisponible » au lieu de se taire |
+| Module qui plante en cours de route | Il est relancé tout seul (après 30 s, puis 1 min, 2 min... jusqu'à 10 min) |
+| Base de données inaccessible (`DB_PATH`, volume) | Marquée en erreur ; le serveur web reste en ligne pour l'expliquer |
+| Telegram injoignable au démarrage | Nouveaux essais automatiques (5 s, 10 s... jusqu'à 5 min) |
+
+Où voir l'état de chaque module :
+- **`/status`** sur Telegram : section « Modules » (✅ actif, ⏳ en attente, ⏸️ désactivé, ❌ erreur,
+  avec la raison) et section « Variables à corriger sur Railway » ;
+- **`/health`** dans le navigateur : la même chose au format JSON (`statut` = `ok` ou `degrade`) ;
+- le **message « 🚀 Bot démarré »** liste les modules désactivés et les variables à corriger.
+
 ## 🛠️ Problèmes fréquents
 
 | Symptôme | Solution |
 |----------|----------|
+| Le service est **CRASHED** sur Railway | Ouvre **Deploy Logs** et regarde les dernières lignes (`Traceback`, `Error`). Depuis cette version, une variable ou un module en panne ne fait plus planter le bot : un plantage complet vient d'une erreur de code ou d'une installation ratée (onglet **Build Logs**) |
 | L'adresse publique affiche « Application failed to respond » alors que le déploiement est vert | Le *target port* du domaine ne correspond pas au port d'écoute : voir « Le target port » à l'étape 9 |
 | `/health` : `bot_telegram` en `erreur` « TELEGRAM_TOKEN refusé » | Le token est faux : recopie-le depuis @BotFather (le serveur web, lui, reste en ligne) |
 | `/health` : `bot_telegram` en `nouvel essai` | Telegram injoignable pour l'instant : le bot réessaie tout seul (5 s, 10 s, 20 s... jusqu'à 5 min) |

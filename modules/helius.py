@@ -43,6 +43,8 @@ async def _requete(
     Envoie une requête à Helius avec la clé API, et renvoie la réponse.
     En cas de "trop de requêtes" (429), on attend un peu et on réessaie (3 essais).
     """
+    if not config.HELIUS_API_KEY:
+        raise ErreurHelius("HELIUS_API_KEY manquante (ajoute-la sur Railway)")
     parametres = {"api-key": config.HELIUS_API_KEY, **(params or {})}
     for essai in range(3):
         try:

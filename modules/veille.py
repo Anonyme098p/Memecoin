@@ -43,6 +43,9 @@ import config
 import db
 import telegram_bot
 from modules import analyse, helius, transactions, wallets
+from modules.supervision import ModuleDesactive, marquer
+
+NOM_MODULE = "veille Telegram"
 
 log = logging.getLogger(__name__)
 
@@ -281,6 +284,7 @@ async def activer(client: ClientLectureSeule) -> None:
     moi = await client.get_me()
     nom = f"@{moi.username}" if moi.username else (moi.first_name or "compte")
     etat.update(client=client, connecte=True, compte=nom, depuis=time.time(), erreur=None)
+    marquer(NOM_MODULE, "actif", f"connectée ({nom})")
     _recharger_canaux()
     client.add_event_handler(_sur_nouveau_message, events.NewMessage())
     log.info("Veille Telegram active (compte %s, %d canaux)", nom, len(_canaux))
@@ -293,7 +297,7 @@ async def demarrer(application: Application) -> None:
     manque = configuree()
     if manque:
         etat["erreur"] = f"désactivée : {manque}"
-        return
+        raise ModuleDesactive(manque)  # le reste du bot continue sans la veille
     session = lire_session()
     if session:
         client = nouveau_client(session)
@@ -307,6 +311,8 @@ async def demarrer(application: Application) -> None:
             etat["erreur"] = f"connexion impossible ({type(erreur).__name__})"
     elif not etat["erreur"]:
         etat["erreur"] = "compte pas encore connecté : ouvre PUBLIC_URL/tglogin"
+    if not etat["connecte"]:
+        marquer(NOM_MODULE, "en attente", etat["erreur"])
     await _boucle(application)
 
 
@@ -320,8 +326,11 @@ async def _boucle(application: Application) -> None:
         try:
             if not client.is_connected():
                 etat["connecte"] = False
+                marquer(NOM_MODULE, "en attente", "connexion perdue, reconnexion en cours")
                 await client.connect()
             etat["connecte"] = client.is_connected()
+            if etat["connecte"]:
+                marquer(NOM_MODULE, "actif", f"connectée ({etat['compte']})")
             for canal in list(_canaux.values()):
                 if canal["membre"] or not canal["nom_utilisateur"]:
                     continue  # canal rejoint : messages reçus en direct
@@ -681,4 +690,5 @@ async def tglogin_deconnexion(request: Request):
             await client.disconnect()
     db.ecrire_parametre("tg_session", "")
     etat.update(client=None, connecte=False, compte=None, erreur="compte déconnecté depuis /tglogin")
+    marquer(NOM_MODULE, "en attente", etat["erreur"])
     return _page_principale('<p class="ok">Compte déconnecté et session supprimée.</p>')
