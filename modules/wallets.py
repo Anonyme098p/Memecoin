@@ -11,7 +11,7 @@ Fonctionnement :
   5. Si au moins 2 wallets suivis achètent le même token en moins de 10 minutes,
      l'alerte devient un SIGNAL FORT.
 
-Commandes Telegram : /addwallet, /removewallet, /wallets
+Commandes Telegram : /addwallet, /removewallet, /wallets, /webhook
 """
 
 import asyncio
@@ -87,64 +87,160 @@ def url_reception() -> str:
     return f"{config.PUBLIC_URL}/helius"
 
 
-async def _trouver_webhook() -> dict | None:
-    """Retrouve NOTRE webhook chez Helius : d'abord par son id mémorisé, sinon par son URL."""
-    webhooks = await helius.lister_webhooks()
-    id_memorise = db.lire_parametre("helius_webhook_id")
-    for webhook in webhooks:
-        if id_memorise and webhook.get("webhookID") == id_memorise:
-            return webhook
-    for webhook in webhooks:
-        if webhook.get("webhookURL") == url_reception():
-            return webhook
-    return None
-
-
-async def synchroniser_webhook() -> str:
-    """
-    Met le webhook Helius en accord avec la liste des wallets suivis.
-    Renvoie un petit texte qui explique ce qui a été fait (affiché sur Telegram).
-    """
+def _probleme_de_config() -> str | None:
+    """Renvoie un message si une variable indispensable au webhook manque, sinon None."""
     if not config.PUBLIC_URL:
         return (
             "⚠️ Webhook Helius NON mis à jour : la variable PUBLIC_URL est vide.\n"
             "Ajoute-la sur Railway (ex : https://mon-bot.up.railway.app)."
         )
+    if not config.HELIUS_WEBHOOK_SECRET:
+        return (
+            "⚠️ Webhook Helius NON mis à jour : la variable HELIUS_WEBHOOK_SECRET est vide.\n"
+            "Ajoute-la sur Railway (une longue phrase secrète, voir le README)."
+        )
+    return None
+
+
+def _nos_webhooks(webhooks: list[dict]) -> list[dict]:
+    """
+    Parmi les webhooks du compte Helius, trouve ceux qui sont à nous :
+      1. ceux qui pointent déjà vers PUBLIC_URL/helius ;
+      2. sinon, celui dont on a mémorisé l'id (cas d'un changement de domaine Railway).
+    """
+    par_url = [w for w in webhooks if w.get("webhookURL") == url_reception()]
+    if par_url:
+        return par_url
+    id_memorise = db.lire_parametre("helius_webhook_id")
+    return [w for w in webhooks if id_memorise and w.get("webhookID") == id_memorise]
+
+
+def _est_a_jour(webhook: dict, adresses: list[str]) -> bool:
+    """True si le webhook Helius a déjà exactement la bonne configuration."""
+    return (
+        webhook.get("webhookURL") == url_reception()
+        and webhook.get("webhookType") == "enhanced"
+        and sorted(webhook.get("transactionTypes") or []) == sorted(config.HELIUS_TRANSACTION_TYPES)
+        and set(webhook.get("accountAddresses") or []) == set(adresses)
+        and webhook.get("authHeader") == config.HELIUS_WEBHOOK_SECRET
+    )
+
+
+async def synchroniser_webhook() -> str:
+    """
+    Met le webhook Helius en accord avec la liste des wallets suivis.
+    S'il existe déjà un webhook pour notre URL, il est modifié (jamais de second webhook).
+    Renvoie un petit texte qui explique ce qui a été fait (affiché sur Telegram).
+    """
+    probleme = _probleme_de_config()
+    if probleme:
+        return probleme
 
     async with _verrou_webhook:
         adresses = [w["adresse"] for w in db.lister_wallets()]
         try:
-            webhook = await _trouver_webhook()
+            trouves = _nos_webhooks(await helius.lister_webhooks())
+            webhook = trouves[0] if trouves else None
+
+            # S'il y a plusieurs webhooks vers notre URL, on garde le premier et on supprime
+            # les autres : sinon chaque achat serait reçu (et alerté) plusieurs fois.
+            for doublon in trouves[1:]:
+                await helius.supprimer_webhook(doublon["webhookID"])
+                log.warning("Webhook Helius en double supprimé : %s", doublon["webhookID"])
+            note = f"\n🧹 {len(trouves) - 1} webhook(s) en double supprimé(s)." if len(trouves) > 1 else ""
 
             # Plus aucun wallet : on supprime le webhook (Helius refuse une liste vide)
             if not adresses:
+                db.ecrire_parametre("helius_webhook_id", "")
                 if webhook:
                     await helius.supprimer_webhook(webhook["webhookID"])
-                db.ecrire_parametre("helius_webhook_id", "")
-                return "🔕 Aucun wallet suivi : webhook Helius supprimé."
+                    return "🔕 Aucun wallet suivi : webhook Helius supprimé." + note
+                return "🔕 Aucun wallet suivi : pas de webhook Helius nécessaire." + note
 
-            # Rien n'a changé : inutile d'appeler Helius (chaque modification coûte des crédits)
-            if (
-                webhook
-                and webhook.get("webhookURL") == url_reception()
-                and set(webhook.get("accountAddresses") or []) == set(adresses)
-                and webhook.get("authHeader") == config.WEBHOOK_SECRET
-            ):
+            # Helius peut désactiver un webhook tout seul (trop d'erreurs) : on le réactive
+            if webhook and webhook.get("active") is False:
+                await helius.activer_webhook(webhook["webhookID"])
+                log.warning("Webhook Helius réactivé : %s", webhook["webhookID"])
+                note += "\n▶️ Le webhook était désactivé chez Helius : il a été réactivé."
+
+            # Rien n'a changé : inutile de le modifier (chaque modification coûte 100 crédits)
+            if webhook and _est_a_jour(webhook, adresses):
                 db.ecrire_parametre("helius_webhook_id", webhook["webhookID"])
-                return f"🔔 Webhook Helius déjà à jour ({len(adresses)} wallet(s) surveillé(s))."
+                return f"🔔 Webhook Helius déjà à jour ({len(adresses)} wallet(s) surveillé(s))." + note
 
             resultat = None
             if webhook:
                 resultat = await helius.modifier_webhook(webhook["webhookID"], url_reception(), adresses)
-            if resultat is None:  # pas de webhook (ou supprimé à la main entre-temps) : on le crée
+                action = "mis à jour"
+            if resultat is None:  # aucun webhook (ou supprimé à la main entre-temps) : on le crée
                 resultat = await helius.creer_webhook(url_reception(), adresses)
+                action = "créé"
             db.ecrire_parametre("helius_webhook_id", resultat.get("webhookID", ""))
         except helius.ErreurHelius as erreur:
             log.error("Mise à jour du webhook Helius impossible : %s", erreur)
             return f"❌ Erreur Helius, webhook non mis à jour : {html.escape(str(erreur))}"
 
-    log.info("Webhook Helius à jour : %d wallet(s) -> %s", len(adresses), url_reception())
-    return f"🔔 Webhook Helius à jour ({len(adresses)} wallet(s) surveillé(s))."
+    log.info("Webhook Helius %s : %d wallet(s) -> %s", action, len(adresses), url_reception())
+    return f"🔔 Webhook Helius {action} ({len(adresses)} wallet(s) surveillé(s))." + note
+
+
+async def etat_webhook() -> str:
+    """Texte (HTML) décrivant l'état du webhook Helius, pour la commande /webhook."""
+    oui_non = lambda ok: "✅" if ok else "❌"  # noqa: E731
+    adresses = {w["adresse"] for w in db.lister_wallets()}
+    lignes = [
+        "🔌 <b>Webhook Helius</b>",
+        "",
+        f"<b>URL attendue :</b> <code>{html.escape(url_reception())}</code>"
+        if config.PUBLIC_URL else "<b>URL attendue :</b> ❌ PUBLIC_URL non définie",
+        f"<b>Secret HELIUS_WEBHOOK_SECRET :</b> {oui_non(config.HELIUS_WEBHOOK_SECRET)}"
+        + ("" if config.HELIUS_WEBHOOK_SECRET else " manquant"),
+        f"<b>Types demandés :</b> {html.escape(', '.join(config.HELIUS_TRANSACTION_TYPES))}",
+        f"<b>Wallets suivis :</b> {len(adresses)}",
+        f"<b>Dernière réception :</b> {db.lire_parametre('dernier_webhook_recu') or 'jamais'}",
+        "",
+    ]
+
+    try:
+        webhooks = await helius.lister_webhooks()
+    except helius.ErreurHelius as erreur:
+        lignes.append(f"❌ Impossible de lire les webhooks Helius : {html.escape(str(erreur))}")
+        return "\n".join(lignes)
+
+    trouves = _nos_webhooks(webhooks) if config.PUBLIC_URL else []
+    if not trouves:
+        lignes.append("❌ <b>Aucun webhook Helius</b> ne pointe vers ce bot.")
+        if adresses and not _probleme_de_config():
+            lignes.append("👉 Tape /webhook sync pour le créer.")
+    else:
+        w = trouves[0]
+        sur_helius = set(w.get("accountAddresses") or [])
+        manquants, en_trop = len(adresses - sur_helius), len(sur_helius - adresses)
+        actif = w.get("active", True) is not False
+        lignes += [
+            f"<b>ID :</b> <code>{html.escape(str(w.get('webhookID')))}</code>",
+            f"<b>URL chez Helius :</b> {oui_non(w.get('webhookURL') == url_reception())} "
+            f"<code>{html.escape(str(w.get('webhookURL')))}</code>",
+            f"<b>Type :</b> {oui_non(w.get('webhookType') == 'enhanced')} {html.escape(str(w.get('webhookType')))}",
+            f"<b>Transactions :</b> {html.escape(', '.join(w.get('transactionTypes') or []) or 'aucune')}",
+            f"<b>Actif :</b> {oui_non(actif)}" + ("" if actif else " (désactivé par Helius)"),
+            f"<b>Adresses chez Helius :</b> {len(sur_helius)}"
+            + (f" — ⚠️ {manquants} manquante(s)" if manquants else "")
+            + (f" — ⚠️ {en_trop} en trop" if en_trop else ""),
+            f"<b>Secret identique :</b> {oui_non(w.get('authHeader') == config.HELIUS_WEBHOOK_SECRET)}",
+        ]
+        if len(trouves) > 1:
+            lignes.append(f"⚠️ {len(trouves)} webhooks pointent vers ce bot (doublons).")
+        lignes.append("")
+        if _est_a_jour(w, sorted(adresses)) and actif and len(trouves) == 1:
+            lignes.append("✅ <b>Tout est synchronisé.</b>")
+        elif _probleme_de_config():
+            lignes.append("⚠️ <b>Pas synchronisé.</b> Corrige d'abord la variable manquante ci-dessus.")
+        else:
+            lignes.append("⚠️ <b>Pas synchronisé.</b> Tape /webhook sync pour corriger.")
+
+    lignes.append(f"\n<i>Webhooks sur ton compte Helius : {len(webhooks)}</i>")
+    return "\n".join(lignes)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +496,17 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(morceau, parse_mode=ParseMode.HTML)
 
 
+async def cmd_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/webhook : affiche l'état du webhook. /webhook sync : le resynchronise d'abord."""
+    texte = ""
+    if context.args and context.args[0].lower() == "sync":
+        texte = await synchroniser_webhook() + "\n\n"
+    texte += await etat_webhook()
+    await update.message.reply_text(
+        texte, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True)
+    )
+
+
 async def bouton_ignorer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Clic sur « Ignorer » : on marque l'alerte comme ignorée et on retire les boutons."""
     query = update.callback_query
@@ -423,4 +530,5 @@ def enregistrer_commandes(application: Application) -> None:
     application.add_handler(CommandHandler("addwallet", cmd_addwallet, filters=moi))
     application.add_handler(CommandHandler("removewallet", cmd_removewallet, filters=moi))
     application.add_handler(CommandHandler("wallets", cmd_wallets, filters=moi))
+    application.add_handler(CommandHandler("webhook", cmd_webhook, filters=moi))
     application.add_handler(CallbackQueryHandler(bouton_ignorer, pattern="^ignorer$"))

@@ -59,7 +59,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/resume — relancer les alertes\n\n"
         "/addwallet <adresse> <surnom> — suivre un wallet\n"
         "/removewallet <adresse> — ne plus suivre un wallet\n"
-        "/wallets — liste des wallets suivis"
+        "/wallets — liste des wallets suivis\n"
+        "/webhook — état du webhook Helius (/webhook sync pour le resynchroniser)"
     )
 
 
@@ -77,6 +78,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"<b>PnL simulé :</b> {stats['pnl_total']:+.3f} SOL\n\n"
         f"<b>Clé Helius :</b> {config.masquer(config.HELIUS_API_KEY)}\n"
         f"<b>Webhook :</b> {config.PUBLIC_URL + '/helius' if config.PUBLIC_URL else '⚠️ PUBLIC_URL non définie'}"
+        f" (détails : /webhook)"
     )
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
 

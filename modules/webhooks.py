@@ -5,8 +5,8 @@ modules/webhooks.py — Routes du serveur web (FastAPI).
   GET  /health   -> utilisé par Railway pour savoir si l'appli est en vie
   POST /helius   -> reçoit les transactions envoyées par le webhook Helius
 
-Sécurité : Helius recopie notre secret (config.WEBHOOK_SECRET) dans l'en-tête
-"Authorization" de chaque requête. Toute requête sans ce secret est refusée.
+Sécurité : Helius recopie notre secret (variable HELIUS_WEBHOOK_SECRET) dans
+l'en-tête "Authorization" de chaque requête. Toute requête sans ce secret est refusée.
 """
 
 import hmac
@@ -35,7 +35,9 @@ async def sante() -> dict:
 
 def _vient_de_helius(authorization: str | None) -> bool:
     """Compare l'en-tête reçu avec notre secret (compare_digest évite les attaques par chronométrage)."""
-    return hmac.compare_digest((authorization or "").encode(), config.WEBHOOK_SECRET.encode())
+    if not config.HELIUS_WEBHOOK_SECRET:
+        return False  # pas de secret configuré : on refuse tout, par sécurité
+    return hmac.compare_digest((authorization or "").encode(), config.HELIUS_WEBHOOK_SECRET.encode())
 
 
 @router.post("/helius")
@@ -56,6 +58,7 @@ async def webhook_helius(
     # Helius envoie une liste de transactions
     transactions = donnees if isinstance(donnees, list) else [donnees]
     log.info("Webhook Helius reçu : %d transaction(s)", len(transactions))
+    db.ecrire_parametre("dernier_webhook_recu", db.maintenant())  # affiché par /webhook
 
     # Helius veut une réponse en moins d'1 seconde : on répond tout de suite
     # et on traite les transactions juste après, en arrière-plan.

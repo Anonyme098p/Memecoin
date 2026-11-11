@@ -54,12 +54,11 @@ async def cycle_de_vie(app: FastAPI):
 
     tache_surveillance = asyncio.create_task(surveillance.boucle(application))
 
-    # Le domaine Railway a pu changer depuis le dernier démarrage : on remet le webhook Helius à jour
-    message_demarrage = "🚀 Bot démarré."
-    if db.lister_wallets():
-        etat_webhook = await wallets.synchroniser_webhook()
-        log.info(etat_webhook)
-        message_demarrage += "\n" + etat_webhook
+    # On remet le webhook Helius à jour (le domaine ou la liste des wallets a pu changer).
+    # S'il existe déjà un webhook pour PUBLIC_URL/helius, il est modifié : jamais de doublon.
+    etat_webhook = await wallets.synchroniser_webhook()
+    log.info(etat_webhook)
+    message_demarrage = "🚀 Bot démarré.\n" + etat_webhook
 
     try:
         await telegram_bot.envoyer_message(application, message_demarrage)
