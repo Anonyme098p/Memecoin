@@ -19,7 +19,7 @@ from fastapi import FastAPI
 import config
 import db
 import telegram_bot
-from modules import nouveaux_tokens, surveillance, wallets, webhooks
+from modules import nouveaux_tokens, surveillance, veille, wallets, webhooks
 
 # Configuration des logs (visibles dans l'onglet "Deploy Logs" de Railway)
 logging.basicConfig(
@@ -59,6 +59,7 @@ async def cycle_de_vie(app: FastAPI):
         asyncio.create_task(nouveaux_tokens.ecouter(application)),
         asyncio.create_task(nouveaux_tokens.boucle_scan(application)),
         asyncio.create_task(nouveaux_tokens.boucle_maj_devs(application)),
+        asyncio.create_task(veille.demarrer(application)),  # veille Telegram (compte utilisateur, lecture seule)
     ]
 
     # On remet le webhook Helius à jour (le domaine ou la liste des wallets a pu changer).
@@ -76,6 +77,7 @@ async def cycle_de_vie(app: FastAPI):
 
     # --- Arrêt (redéploiement, Ctrl+C...) ---
     log.info("Arrêt en cours...")
+    await veille.arreter()
     for tache in (tache_surveillance, tache_hebdo, *taches_tokens):
         tache.cancel()
         try:
@@ -91,6 +93,7 @@ async def cycle_de_vie(app: FastAPI):
 # L'application web FastAPI
 app = FastAPI(title="Bot memecoins Solana", lifespan=cycle_de_vie)
 app.include_router(webhooks.router)
+app.include_router(veille.router)  # page /tglogin
 
 
 if __name__ == "__main__":

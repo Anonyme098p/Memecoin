@@ -13,6 +13,8 @@ Tables :
   - analyses_wallets : historique des analyses de wallets (note, verdict, rapport)
   - tokens_crees     : tokens créés par les devs suivis ou analysés (market cap max, rug)
   - createurs        : bilan de chaque créateur (tokens lancés, réussites, rugs, verdict)
+  - canaux_suivis    : canaux Telegram surveillés par la veille (modules/veille.py)
+  - mentions_veille  : adresses de tokens repérées dans ces canaux
   - trades_simules   : les trades fictifs (paper trading) pour tester une stratégie
   - parametres       : petits réglages clé/valeur (ex : bot en pause ou non)
 """
@@ -108,6 +110,29 @@ CREATE TABLE IF NOT EXISTS createurs (
     rapport        TEXT
 );
 
+-- Veille Telegram : canaux surveillés avec le compte utilisateur (lecture seule)
+CREATE TABLE IF NOT EXISTS canaux_suivis (
+    id                  INTEGER PRIMARY KEY,   -- identifiant Telegram du canal (ex : -1001234567890)
+    titre               TEXT,
+    nom_utilisateur     TEXT,                  -- @nom pour un canal public, vide sinon
+    lien                TEXT,                  -- lien donné à /addchannel
+    membre              INTEGER NOT NULL,      -- 1 = le compte en est membre (lecture en direct)
+    dernier_message_id  INTEGER NOT NULL DEFAULT 0,
+    date_ajout          TEXT NOT NULL
+);
+
+-- Adresses de tokens repérées dans les canaux suivis (pour le croisement entre canaux)
+CREATE TABLE IF NOT EXISTS mentions_veille (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint           TEXT NOT NULL,
+    canal_id       INTEGER NOT NULL,
+    canal_titre    TEXT,
+    message_id     INTEGER NOT NULL,
+    lien_message   TEXT,
+    horodatage     INTEGER NOT NULL,       -- heure du message (timestamp Unix)
+    UNIQUE (mint, canal_id, message_id)
+);
+
 CREATE TABLE IF NOT EXISTS parametres (
     cle     TEXT PRIMARY KEY,
     valeur  TEXT NOT NULL
@@ -133,6 +158,7 @@ CREATE INDEX IF NOT EXISTS idx_alertes_token ON alertes_envoyees (token_adresse)
 CREATE INDEX IF NOT EXISTS idx_achats_token ON achats_wallets (token_adresse, horodatage);
 CREATE INDEX IF NOT EXISTS idx_analyses_adresse ON analyses_wallets (adresse, date_analyse);
 CREATE INDEX IF NOT EXISTS idx_tokens_createur ON tokens_crees (createur, cree_le);
+CREATE INDEX IF NOT EXISTS idx_mentions_mint ON mentions_veille (mint, horodatage);
 """
 
 # Colonnes ajoutées après la première version : si ta base existe déjà sur Railway,
@@ -494,6 +520,65 @@ def compter_alertes(prefixe_type: str, depuis_iso: str) -> int:
             "SELECT COUNT(*) FROM alertes_envoyees WHERE type LIKE ? AND date_envoi >= ?",
             (prefixe_type + "%", depuis_iso),
         ).fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
+# Veille Telegram
+# ---------------------------------------------------------------------------
+
+def ajouter_canal(id_canal: int, titre: str, nom_utilisateur: str | None, lien: str,
+                  membre: bool, dernier_message_id: int) -> bool:
+    """Ajoute (ou met à jour) un canal suivi. Renvoie True s'il est nouveau."""
+    with connexion() as conn:
+        existe = conn.execute("SELECT 1 FROM canaux_suivis WHERE id = ?", (id_canal,)).fetchone()
+        conn.execute(
+            "INSERT INTO canaux_suivis (id, titre, nom_utilisateur, lien, membre, dernier_message_id, date_ajout) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET titre = excluded.titre, "
+            "nom_utilisateur = excluded.nom_utilisateur, lien = excluded.lien, membre = excluded.membre",
+            (id_canal, titre, nom_utilisateur, lien, int(membre), dernier_message_id, maintenant()),
+        )
+        return existe is None
+
+
+def supprimer_canal(id_canal: int) -> bool:
+    with connexion() as conn:
+        return conn.execute("DELETE FROM canaux_suivis WHERE id = ?", (id_canal,)).rowcount > 0
+
+
+def lister_canaux() -> list[sqlite3.Row]:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM canaux_suivis ORDER BY date_ajout").fetchall()
+
+
+def maj_dernier_message(id_canal: int, message_id: int) -> None:
+    with connexion() as conn:
+        conn.execute("UPDATE canaux_suivis SET dernier_message_id = MAX(dernier_message_id, ?) WHERE id = ?",
+                     (message_id, id_canal))
+
+
+def enregistrer_mention(mint: str, canal_id: int, canal_titre: str, message_id: int,
+                        lien_message: str | None, horodatage: int) -> bool:
+    with connexion() as conn:
+        return conn.execute(
+            "INSERT OR IGNORE INTO mentions_veille (mint, canal_id, canal_titre, message_id, lien_message, horodatage) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (mint, canal_id, canal_titre, message_id, lien_message, horodatage),
+        ).rowcount > 0
+
+
+def canaux_ayant_cite(mint: str, depuis: int, jusqua: int) -> list[sqlite3.Row]:
+    """Pour chaque canal ayant cité ce token dans la fenêtre : sa PREMIÈRE mention."""
+    with connexion() as conn:
+        return conn.execute(
+            "SELECT canal_id, canal_titre, lien_message, MIN(horodatage) AS horodatage FROM mentions_veille "
+            "WHERE mint = ? AND horodatage BETWEEN ? AND ? GROUP BY canal_id ORDER BY horodatage",
+            (mint, depuis, jusqua),
+        ).fetchall()
+
+
+def compter_mentions_canal(canal_id: int) -> int:
+    with connexion() as conn:
+        return conn.execute("SELECT COUNT(DISTINCT mint) FROM mentions_veille WHERE canal_id = ?", (canal_id,)).fetchone()[0]
 
 
 # ---------------------------------------------------------------------------

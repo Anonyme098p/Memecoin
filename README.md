@@ -9,7 +9,9 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 > et reçoit une note de 0 à 100 avec un verdict SUIVRE / À SURVEILLER / ÉVITER.
 > Chaque token alerté reçoit aussi une note de sécurité de 0 à 100 (DexScreener, RugCheck,
 > Helius), avec ses chiffres clés et ses drapeaux rouges. Les créations de tokens pump.fun sont
-> écoutées en temps réel : alerte PRIORITAIRE quand un dev suivi lance un token.
+> écoutées en temps réel : alerte PRIORITAIRE quand un dev suivi lance un token. Enfin, une veille
+> lit (sans jamais rien envoyer) des canaux Telegram avec ton compte et alerte quand un même token
+> y est cité plusieurs fois.
 
 ---
 
@@ -24,6 +26,7 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 ├── modules/
 │   ├── wallets.py       # Suivi des wallets : commandes, alertes, analyse du dimanche
 │   ├── nouveaux_tokens.py # Créations pump.fun en temps réel, devs suivis, /scanall, /devscore
+│   ├── veille.py        # Veille de canaux Telegram (compte utilisateur, lecture seule), page /tglogin
 │   ├── analyse.py       # Note de sécurité d'un token (0 à 100), règles dans rules.json
 │   ├── analyse_wallet.py # Analyse d'historique d'un wallet : trades, statistiques, risques, note
 │   ├── transactions.py  # Interprétation d'une transaction : achat, vente ou ignorée (et pourquoi)
@@ -59,6 +62,10 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/devs` | Liste des devs suivis avec leur bilan, état du flux pump.fun et de /scanall |
 | `/devscore <adresse>` | Bilan des lancements d'un créateur (tokens créés, réussites, rugs) et verdict SUIVRE / À SURVEILLER / ÉVITER |
 | `/scanall on <score>` / `off` | Alertes aussi pour les créateurs inconnus dont le token décolle et atteint ce score |
+| `/addchannel <lien>` | Suit un canal ou groupe Telegram (`t.me/nom`, `@nom`, ou lien d'invitation d'un canal déjà rejoint) |
+| `/removechannel <lien>` | Arrête de suivre un canal (lien, `@nom` ou titre) |
+| `/channels` | Canaux suivis, mode de lecture et nombre de tokens repérés |
+| `/veille` | État de la connexion du compte et nombre de messages lus depuis le démarrage |
 | `/debugtx <adresse>` | Montre comment les 5 dernières transactions du wallet ont été comprises (achat, vente ou ignorée, et pourquoi) |
 | `/webhook` | État du webhook Helius : URL, type, transactions, actif ou non, adresses synchronisées, secret identique, dernière réception |
 | `/webhook sync` | Force la resynchronisation du webhook Helius, puis affiche son état |
@@ -73,6 +80,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `devs_suivis`      | Devs (créateurs de tokens) surveillés |
 | `tokens_crees`     | Tokens des devs suivis ou analysés : market cap actuelle et maximale, rug |
 | `createurs`        | Bilan de chaque créateur : tokens lancés, réussites, rugs, verdict |
+| `canaux_suivis`    | Canaux Telegram de la veille |
+| `mentions_veille`  | Tokens repérés dans ces canaux (canal, message, heure) |
 | `alertes_envoyees` | Historique des alertes : heure, wallet, montant, **prix en SOL et en $ au moment du signal**, note du token, DANGER, statut (envoyée / ignorée) |
 | `achats_wallets`   | Chaque achat détecté (même bot en pause) : sert à repérer les SIGNAUX FORTS |
 | `analyses_wallets` | Historique des analyses : note, verdict, SCALPEUR, statistiques et rapport complet |
@@ -100,6 +109,10 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `SCAN_DELAI_S`            | ❌ | /scanall : délai avant de revérifier un nouveau token (défaut : 120 s) |
 | `SCAN_MC_MIN_USD` / `SCAN_TX_5MIN_MIN` | ❌ | /scanall : market cap et transactions en 5 min minimum pour qu'un token soit analysé (défaut : 10 000 $ et 20) |
 | `DEV_MAX_TOKENS_ANALYSES` | ❌ | Nombre de tokens d'un créateur dont le résultat est vérifié (défaut : 30, les plus récents) |
+| `TG_API_ID` / `TG_API_HASH` | ❌ (veille) | Identifiants d'application Telegram, voir « Veille Telegram » plus bas |
+| `TGLOGIN_PASSWORD`        | ❌ (veille) | Mot de passe de la page `/tglogin` (12 caractères minimum). Sert aussi à chiffrer la session : le changer oblige à se reconnecter |
+| `VEILLE_MIN_CANAUX` / `VEILLE_FENETRE_MIN` | ❌ | Alerte si un token est cité dans au moins 2 canaux en 30 minutes (défauts) |
+| `VEILLE_RELECTURE_S`      | ❌ | Relecture des canaux publics non rejoints (défaut : 60 s) |
 | `PUMPPORTAL_WS_URL`       | ❌ | Adresse du flux temps réel (défaut : PumpPortal) |
 | `RULES_PATH`              | ❌ | Chemin du fichier de règles de la note des tokens (défaut : `rules.json` du projet) |
 | `ANALYSE_TOKEN_CACHE_S`   | ❌ | Secondes pendant lesquelles l'analyse d'un token est réutilisée (défaut : 120) |
@@ -144,6 +157,87 @@ Bon à savoir :
 - Le montant en SOL des achats pump.fun peut inclure de petits frais (c'est une estimation).
 - Chaque création ou modification du webhook consomme des crédits Helius : le bot ne contacte
   Helius que si la liste des wallets ou l'adresse a vraiment changé.
+
+---
+
+## 📡 Veille Telegram (avec ton compte, en lecture seule)
+
+Le bot lit des canaux Telegram **avec ton propre compte** (bibliothèque Telethon), y repère les
+adresses de tokens Solana, et t'alerte quand **un même token est cité dans au moins 2 canaux en
+moins de 30 minutes**, avec la note du token et la liste des canaux (liens vers les messages).
+
+### Étape 1 — Obtenir TG_API_ID et TG_API_HASH (une seule fois, 2 minutes)
+
+1. Sur ton téléphone, ouvre **https://my.telegram.org** dans le navigateur.
+2. Entre ton numéro au format international (ex : `+33612345678`) et touche **Next**.
+3. Telegram t'envoie un code **dans l'application Telegram** (conversation « Telegram »).
+   Recopie-le sur le site et touche **Sign In**.
+4. Touche **API development tools**.
+5. Remplis le formulaire « Create new application » :
+   - **App title** : par exemple `Veille memecoins` ;
+   - **Short name** : par exemple `veillememe` (5 à 32 lettres ou chiffres) ;
+   - **Platform** : `Other` ; les autres champs peuvent rester vides.
+6. Touche **Create application**. La page affiche :
+   - **App api_id** : un nombre → c'est `TG_API_ID` ;
+   - **App api_hash** : 32 caractères → c'est `TG_API_HASH`.
+
+⚠️ Ces deux valeurs, comme ta session Telegram, donnent accès à ton compte : ne les partage avec
+personne et ne les mets jamais dans le code ou sur GitHub.
+
+### Étape 2 — Ajouter les variables sur Railway
+
+Dans l'onglet **Variables** du service :
+
+```
+TG_API_ID=1234567
+TG_API_HASH=0123456789abcdef0123456789abcdef
+TGLOGIN_PASSWORD=une-longue-phrase-secrete-a-toi
+```
+
+`TGLOGIN_PASSWORD` protège la page de connexion (12 caractères minimum) et sert aussi à chiffrer
+ta session dans la base. Si tu le changes plus tard, il faudra te reconnecter via `/tglogin`.
+`TG_SESSION` n'est pas nécessaire.
+
+### Étape 3 — Connecter ton compte depuis ton téléphone
+
+1. Ouvre `https://ton-bot.up.railway.app/tglogin` dans le navigateur du téléphone.
+2. Entre le mot de passe `TGLOGIN_PASSWORD` (5 essais au maximum par quart d'heure).
+3. Entre ton numéro de téléphone, touche **Recevoir le code**.
+4. Ouvre l'application Telegram : le code est dans la conversation « Telegram ». Reviens dans le
+   navigateur et entre-le.
+5. Si ton compte a un mot de passe (validation en deux étapes), entre-le.
+6. C'est fini : la session est enregistrée **chiffrée** dans la base, le bot t'envoie
+   « ✅ Veille Telegram connectée », et elle reprend toute seule à chaque redémarrage.
+
+La même page permet de **déconnecter** le compte (la session est alors supprimée, y compris
+côté Telegram). Tu peux aussi la révoquer depuis Telegram : Paramètres → Appareils.
+
+### Étape 4 — Choisir les canaux
+
+- `/addchannel https://t.me/nomducanal` (ou `@nomducanal`) :
+  - si ton compte **est membre** du canal, ses messages sont lus **en direct** ;
+  - si c'est un canal **public** que tu n'as pas rejoint, il est relu **toutes les minutes** ;
+  - un canal **privé** doit d'abord être rejoint par toi, depuis ton téléphone, avec son lien
+    d'invitation ; ensuite `/addchannel <lien d'invitation>` fonctionne.
+- `/channels` liste les canaux, `/removechannel` en retire un, `/veille` montre l'état de la
+  connexion et le nombre de messages lus depuis le démarrage.
+
+### Lecture seule, garantie par le code
+
+Le compte n'envoie jamais rien. Le client Telethon du bot **refuse avant tout envoi** toute
+requête d'écriture : envoyer, transférer, modifier ou supprimer un message, réagir, rejoindre ou
+quitter un canal, marquer comme lu, modifier le profil… Seules les requêtes de connexion (envoi du
+code, déconnexion) sont permises. C'est aussi pour ça que le bot ne rejoint jamais un canal tout
+seul. Seuls les messages des canaux suivis sont lus ; tes conversations privées sont ignorées.
+
+### Détection des tokens
+
+Le bot cherche les adresses Solana dans le texte **et** dans les liens cachés (« acheter ici »,
+liens pump.fun, DexScreener, GMGN…), puis vérifie auprès de Helius que c'est bien un **token** (les
+adresses de wallets, de pools ou les signatures de transactions sont ignorées). Les liens DexScreener
+qui contiennent l'adresse de la paire au lieu de celle du token ne sont pas reconnus. Les alertes de
+veille respectent `/pause` et `/minscore`. Si le token est cité dans un 3e canal, une nouvelle
+alerte est envoyée.
 
 ---
 
@@ -522,6 +616,10 @@ instance** (replica) sur Railway.
 | `❌ Erreur Helius ... 401` | `HELIUS_API_KEY` est fausse |
 | `❌ Erreur Helius ... 429` ou limite de webhooks | Trop de requêtes, ou trop de webhooks sur ton compte Helius (5 en gratuit) : supprime les anciens sur le dashboard Helius |
 | `❌ Analyse impossible ... 401` / `403` | Clé Helius fausse, ou méthode non disponible avec ton offre Helius |
+| `/tglogin` affiche « Veille Telegram désactivée » | Ajoute `TG_API_ID`, `TG_API_HASH` et `TGLOGIN_PASSWORD` (12 caractères minimum) |
+| `/veille` : « session illisible » | `TGLOGIN_PASSWORD` ou `TG_API_HASH` a changé : reconnecte-toi sur `/tglogin` |
+| `/veille` : « session expirée ou révoquée » | La session a été fermée depuis Telegram (Appareils) : reconnecte-toi sur `/tglogin` |
+| `/addchannel` : « canal privé non rejoint » | Rejoins le canal depuis ton téléphone, puis recommence |
 | Risques marqués ❔ « non vérifié » | Helius n'a pas répondu à `getTransactionsForAddress` : la note est calculée sans ces vérifications (aucun malus) |
 | L'analyse du dimanche n'arrive pas | Le bot doit être allumé le dimanche après 10 h. Vérifie les logs : `Analyse hebdomadaire de N wallet(s)` |
 | Wallet ajouté mais aucune alerte | Vérifie dans les logs Railway la ligne `Webhook Helius reçu`. Si elle n'apparaît jamais, regarde les logs du webhook sur le dashboard Helius. Tape `/webhook` : tout doit être ✅. Si tu vois `Requête refusée sur /helius` dans les logs, le secret chez Helius est différent : tape `/webhook sync` |

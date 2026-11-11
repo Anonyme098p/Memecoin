@@ -5,6 +5,10 @@ fastapi==0.162.4
 uvicorn==0.54.0
 # Flux temps réel des nouveaux tokens (websocket PumpPortal)
 websockets==15.0.1
+# Veille Telegram avec un compte utilisateur, formulaires web et chiffrement de la session
+telethon==1.45.0
+python-multipart==0.0.33
+cryptography==50.0.2
 # Lecture du fichier .env en local
 python-dotenv==1.2.4
 # Requêtes HTTP (pour appeler l'API Helius plus tard)
