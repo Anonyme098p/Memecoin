@@ -5,6 +5,7 @@ Dossier modules/ : les fonctionnalités du bot, chacune dans son fichier.
   - surveillance.py : boucle de fond qui tournera en permanence (logique Helius à ajouter)
   - webhooks.py     : routes du serveur web (FastAPI), dont /helius qui reçoit les transactions
   - wallets.py      : suivi des wallets (/addwallet, /removewallet, /wallets) et alertes d'achat
+  - nouveaux_tokens.py : créations pump.fun en temps réel, devs suivis, /scanall, /devscore
   - analyse.py      : note de sécurité d'un token (0 à 100), règles dans rules.json
   - analyse_wallet.py : analyse de l'historique d'un wallet (trades, risques, note, verdict)
   - transactions.py : lecture des transactions Helius (détection des achats et des ventes)

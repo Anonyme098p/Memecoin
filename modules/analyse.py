@@ -180,6 +180,12 @@ def _remplir_rugcheck(d: Donnees, rapport: object, regles: dict) -> None:
         if type_connu and type_connu != "CREATOR":
             continue
         holders.append((proprietaire, float(h.get("pct") or 0), bool(h.get("insider"))))
+    # Token tout neuf : RugCheck liste les holders mais n'a pas encore calculé leurs parts (toutes à 0).
+    # On ignore alors ces chiffres (holders et créateur) : Helius prendra le relais avec l'état réel.
+    if holders and not any(pct > 0 for _, pct, _ in holders):
+        d.indisponible["RugCheck"] = "holders pas encore calculés (token trop récent)"
+        holders = []
+        rapport = {**rapport, "creatorBalance": None}
     if holders:
         d.holders = [(w, pct) for w, pct, _ in holders]
         d.top10_pct = sum(pct for _, pct, _ in holders[:10])

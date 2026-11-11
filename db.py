@@ -11,6 +11,8 @@ Tables :
   - alertes_envoyees : l'historique des alertes envoyées sur Telegram (avec heure et prix)
   - achats_wallets   : chaque achat détecté sur un wallet suivi (sert au SIGNAL FORT)
   - analyses_wallets : historique des analyses de wallets (note, verdict, rapport)
+  - tokens_crees     : tokens créés par les devs suivis ou analysés (market cap max, rug)
+  - createurs        : bilan de chaque créateur (tokens lancés, réussites, rugs, verdict)
   - trades_simules   : les trades fictifs (paper trading) pour tester une stratégie
   - parametres       : petits réglages clé/valeur (ex : bot en pause ou non)
 """
@@ -81,6 +83,31 @@ CREATE TABLE IF NOT EXISTS trades_simules (
     date_fermeture  TEXT
 );
 
+-- Tokens pump.fun créés par les devs suivis ou analysés (pas TOUS les tokens : il y en a des dizaines de milliers par jour)
+CREATE TABLE IF NOT EXISTS tokens_crees (
+    mint        TEXT PRIMARY KEY,
+    createur    TEXT NOT NULL,
+    nom         TEXT,
+    symbole     TEXT,
+    cree_le     INTEGER,            -- timestamp Unix de la création
+    mc_actuel   REAL,               -- market cap actuelle en $ (dernière vérification)
+    mc_max      REAL,               -- plus haute market cap connue en $
+    rug         INTEGER,            -- 1 = rug, 0 = non, vide = inconnu
+    maj_le      INTEGER             -- dernière vérification (timestamp Unix)
+);
+
+-- Bilan de chaque créateur (recalculé par /devscore, /adddev et chaque jour pour les devs suivis)
+CREATE TABLE IF NOT EXISTS createurs (
+    adresse        TEXT PRIMARY KEY,
+    nb_lances      INTEGER NOT NULL,   -- tokens créés
+    nb_analyses    INTEGER NOT NULL,   -- tokens dont on a pu vérifier le résultat
+    nb_reussites   INTEGER NOT NULL,   -- tokens ayant dépassé le seuil de market cap (100k $)
+    nb_rugs        INTEGER NOT NULL,
+    verdict        TEXT NOT NULL,      -- SUIVRE / À SURVEILLER / ÉVITER
+    date_maj       TEXT NOT NULL,
+    rapport        TEXT
+);
+
 CREATE TABLE IF NOT EXISTS parametres (
     cle     TEXT PRIMARY KEY,
     valeur  TEXT NOT NULL
@@ -105,6 +132,7 @@ CREATE TABLE IF NOT EXISTS analyses_wallets (
 CREATE INDEX IF NOT EXISTS idx_alertes_token ON alertes_envoyees (token_adresse);
 CREATE INDEX IF NOT EXISTS idx_achats_token ON achats_wallets (token_adresse, horodatage);
 CREATE INDEX IF NOT EXISTS idx_analyses_adresse ON analyses_wallets (adresse, date_analyse);
+CREATE INDEX IF NOT EXISTS idx_tokens_createur ON tokens_crees (createur, cree_le);
 """
 
 # Colonnes ajoutées après la première version : si ta base existe déjà sur Railway,
@@ -292,13 +320,30 @@ def lister_wallets(actifs_seulement: bool = True) -> list[sqlite3.Row]:
 # Devs suivis
 # ---------------------------------------------------------------------------
 
-def ajouter_dev(adresse: str, nom: str | None = None, note: str | None = None) -> None:
-    """Ajoute un dev à surveiller (ne fait rien s'il existe déjà)."""
+def ajouter_dev(adresse: str, nom: str | None = None, note: str | None = None) -> bool:
+    """
+    Ajoute un dev (créateur de tokens) à surveiller. S'il existe déjà, son surnom est mis à jour.
+    Renvoie True si c'est un nouveau dev.
+    """
     with connexion() as conn:
+        if conn.execute("SELECT 1 FROM devs_suivis WHERE adresse = ?", (adresse,)).fetchone():
+            conn.execute("UPDATE devs_suivis SET nom = ?, actif = 1 WHERE adresse = ?", (nom, adresse))
+            return False
         conn.execute(
-            "INSERT OR IGNORE INTO devs_suivis (adresse, nom, note, date_ajout) VALUES (?, ?, ?, ?)",
+            "INSERT INTO devs_suivis (adresse, nom, note, date_ajout) VALUES (?, ?, ?, ?)",
             (adresse, nom, note, maintenant()),
         )
+        return True
+
+
+def supprimer_dev(adresse: str) -> bool:
+    with connexion() as conn:
+        return conn.execute("DELETE FROM devs_suivis WHERE adresse = ?", (adresse,)).rowcount > 0
+
+
+def lire_dev(adresse: str) -> sqlite3.Row | None:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM devs_suivis WHERE adresse = ? AND actif = 1", (adresse,)).fetchone()
 
 
 def lister_devs(actifs_seulement: bool = True) -> list[sqlite3.Row]:
@@ -389,6 +434,66 @@ def acheteurs_recents(token_adresse: str, horodatage: int, fenetre_secondes: int
             "GROUP BY a.wallet_adresse ORDER BY premier",
             (token_adresse, horodatage - fenetre_secondes, horodatage + fenetre_secondes),
         ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Tokens créés et bilan des créateurs
+# ---------------------------------------------------------------------------
+
+def enregistrer_token_cree(mint: str, createur: str, nom: str | None, symbole: str | None, cree_le: int) -> None:
+    with connexion() as conn:
+        conn.execute(
+            "INSERT INTO tokens_crees (mint, createur, nom, symbole, cree_le) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(mint) DO UPDATE SET nom = COALESCE(excluded.nom, nom), symbole = COALESCE(excluded.symbole, symbole)",
+            (mint, createur, nom, symbole, cree_le),
+        )
+
+
+def tokens_du_createur(createur: str) -> list[sqlite3.Row]:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM tokens_crees WHERE createur = ? ORDER BY cree_le DESC", (createur,)).fetchall()
+
+
+def lire_token_cree(mint: str) -> sqlite3.Row | None:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM tokens_crees WHERE mint = ?", (mint,)).fetchone()
+
+
+def maj_resultat_token(mint: str, mc_actuel: float | None, mc_max: float | None, rug: bool | None, maj_le: int) -> None:
+    """Met à jour la market cap et le statut rug d'un token (la market cap max ne fait que monter)."""
+    with connexion() as conn:
+        conn.execute(
+            "UPDATE tokens_crees SET mc_actuel = COALESCE(?, mc_actuel), "
+            "mc_max = MAX(COALESCE(mc_max, 0), COALESCE(?, 0), COALESCE(?, 0)), "
+            "rug = COALESCE(?, rug), maj_le = ? WHERE mint = ?",
+            (mc_actuel, mc_max, mc_actuel, None if rug is None else int(rug), maj_le, mint),
+        )
+
+
+def enregistrer_bilan_createur(adresse: str, nb_lances: int, nb_analyses: int, nb_reussites: int,
+                               nb_rugs: int, verdict: str, rapport: str) -> None:
+    with connexion() as conn:
+        conn.execute(
+            "INSERT INTO createurs (adresse, nb_lances, nb_analyses, nb_reussites, nb_rugs, verdict, date_maj, rapport) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(adresse) DO UPDATE SET nb_lances = excluded.nb_lances, "
+            "nb_analyses = excluded.nb_analyses, nb_reussites = excluded.nb_reussites, nb_rugs = excluded.nb_rugs, "
+            "verdict = excluded.verdict, date_maj = excluded.date_maj, rapport = excluded.rapport",
+            (adresse, nb_lances, nb_analyses, nb_reussites, nb_rugs, verdict, maintenant(), rapport),
+        )
+
+
+def lire_bilan_createur(adresse: str) -> sqlite3.Row | None:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM createurs WHERE adresse = ?", (adresse,)).fetchone()
+
+
+def compter_alertes(prefixe_type: str, depuis_iso: str) -> int:
+    """Nombre d'alertes d'un type (ex : "nouveau_token") envoyées depuis une date ISO."""
+    with connexion() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM alertes_envoyees WHERE type LIKE ? AND date_envoi >= ?",
+            (prefixe_type + "%", depuis_iso),
+        ).fetchone()[0]
 
 
 # ---------------------------------------------------------------------------

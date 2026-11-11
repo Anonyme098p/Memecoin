@@ -63,12 +63,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/score <adresse> — analyser un wallet sans le suivre\n"
         "/debugtx <adresse> — voir comment ses 5 dernières transactions sont comprises\n"
         "/check <adresse> — note de sécurité d'un token\n"
-        "/minscore <0-100> — ne recevoir que les alertes au-dessus de ce score\n"
+        "/minscore <0-100> — ne recevoir que les alertes au-dessus de ce score\n\n"
+        "/adddev <adresse> <surnom> — suivre un créateur de tokens\n"
+        "/removedev <adresse> — ne plus le suivre\n"
+        "/devs — liste des devs suivis et état du flux pump.fun\n"
+        "/devscore <adresse> — bilan des lancements d'un créateur\n"
+        "/scanall on <score> | off — alertes pour les créateurs inconnus\n"
         "/webhook — état du webhook Helius (/webhook sync pour le resynchroniser)"
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from modules import nouveaux_tokens  # import ici pour éviter une boucle d'imports
     stats = db.statistiques()
     etat = "⏸️ En pause" if db.est_en_pause() else "✅ Actif"
     texte = (
@@ -82,7 +88,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"<b>PnL simulé :</b> {stats['pnl_total']:+.3f} SOL\n\n"
         f"<b>Clé Helius :</b> {config.masquer(config.HELIUS_API_KEY)}\n"
         f"<b>Webhook :</b> {config.PUBLIC_URL + '/helius' if config.PUBLIC_URL else '⚠️ PUBLIC_URL non définie'}"
-        f" (détails : /webhook)"
+        f" (détails : /webhook)\n"
+        f"{nouveaux_tokens.texte_statut_flux()}"
     )
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
 
@@ -119,8 +126,9 @@ def construire_application() -> Application:
     application.add_handler(CommandHandler("resume", cmd_resume, filters=SEULEMENT_MOI))
 
     # Commandes des modules (import ici pour éviter une boucle d'imports)
-    from modules import wallets
+    from modules import nouveaux_tokens, wallets
     wallets.enregistrer_commandes(application)
+    nouveaux_tokens.enregistrer_commandes(application)
 
     application.add_error_handler(gestion_erreurs)
     return application
