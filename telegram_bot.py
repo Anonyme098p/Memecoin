@@ -12,6 +12,7 @@ Commandes :
   (+ les commandes des modules, ex : /addwallet, /removewallet, /wallets dans modules/wallets.py)
 """
 
+import html
 import logging
 import time
 
@@ -68,13 +69,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/removedev <adresse> — ne plus le suivre\n"
         "/devs — liste des devs suivis et état du flux pump.fun\n"
         "/devscore <adresse> — bilan des lancements d'un créateur\n"
-        "/scanall on <score> | off — alertes pour les créateurs inconnus\n"
+        "/scanall on <score> | off — alertes pour les créateurs inconnus\n\n"
+        "/addchannel <lien> — suivre un canal Telegram (veille)\n"
+        "/removechannel <lien> — ne plus le suivre\n"
+        "/channels — canaux suivis\n"
+        "/veille — état de la veille Telegram\n"
         "/webhook — état du webhook Helius (/webhook sync pour le resynchroniser)"
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from modules import nouveaux_tokens  # import ici pour éviter une boucle d'imports
+    from modules import nouveaux_tokens, veille  # import ici pour éviter une boucle d'imports
     stats = db.statistiques()
     etat = "⏸️ En pause" if db.est_en_pause() else "✅ Actif"
     texte = (
@@ -89,7 +94,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"<b>Clé Helius :</b> {config.masquer(config.HELIUS_API_KEY)}\n"
         f"<b>Webhook :</b> {config.PUBLIC_URL + '/helius' if config.PUBLIC_URL else '⚠️ PUBLIC_URL non définie'}"
         f" (détails : /webhook)\n"
-        f"{nouveaux_tokens.texte_statut_flux()}"
+        f"{nouveaux_tokens.texte_statut_flux()}\n"
+        f"{html.escape(veille.texte_etat_court(), quote=False)}"
     )
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
 
@@ -126,9 +132,10 @@ def construire_application() -> Application:
     application.add_handler(CommandHandler("resume", cmd_resume, filters=SEULEMENT_MOI))
 
     # Commandes des modules (import ici pour éviter une boucle d'imports)
-    from modules import nouveaux_tokens, wallets
+    from modules import nouveaux_tokens, veille, wallets
     wallets.enregistrer_commandes(application)
     nouveaux_tokens.enregistrer_commandes(application)
+    veille.enregistrer_commandes(application)
 
     application.add_error_handler(gestion_erreurs)
     return application

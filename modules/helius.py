@@ -379,3 +379,10 @@ def mint_de_la_creation(tx: dict) -> str | None:
         if cle in mints:
             return cle
     return None
+
+
+async def est_un_mint(adresse: str) -> bool:
+    """True si l'adresse est un mint (un token), False pour un wallet, une pool, etc."""
+    resultat = await _rpc_simple("getAccountInfo", [adresse, {"encoding": "jsonParsed"}])
+    valeur = (resultat or {}).get("value") or {}
+    return ((valeur.get("data") or {}).get("parsed") or {}).get("type") == "mint"

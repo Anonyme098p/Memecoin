@@ -119,6 +119,18 @@ SCAN_TX_5MIN_MIN: int = int(os.getenv("SCAN_TX_5MIN_MIN", "20"))
 # Nombre maximum de tokens d'un créateur dont on vérifie le résultat (/devscore)
 DEV_MAX_TOKENS_ANALYSES: int = int(os.getenv("DEV_MAX_TOKENS_ANALYSES", "30"))
 
+# --- Veille Telegram avec un compte utilisateur (modules/veille.py) ---
+# À obtenir sur https://my.telegram.org (voir le README). Facultatif : sans elles, la veille est désactivée.
+TG_API_ID: int = int(os.getenv("TG_API_ID", "0").strip() or 0)
+TG_API_HASH: str = os.getenv("TG_API_HASH", "").strip()
+# Mot de passe de la page /tglogin (12 caractères minimum). Il sert aussi à chiffrer la session Telegram.
+TGLOGIN_PASSWORD: str = os.getenv("TGLOGIN_PASSWORD", "").strip()
+# Alerte si un même token est cité dans au moins VEILLE_MIN_CANAUX canaux en VEILLE_FENETRE_MIN minutes
+VEILLE_MIN_CANAUX: int = int(os.getenv("VEILLE_MIN_CANAUX", "2"))
+VEILLE_FENETRE_MIN: int = int(os.getenv("VEILLE_FENETRE_MIN", "30"))
+# Fréquence de lecture des canaux publics dont le compte n'est pas membre (secondes)
+VEILLE_RELECTURE_S: int = int(os.getenv("VEILLE_RELECTURE_S", "60"))
+
 # --- Divers ---
 # Intervalle (en secondes) entre deux tours de la boucle de surveillance
 INTERVALLE_SURVEILLANCE: int = int(os.getenv("INTERVALLE_SURVEILLANCE", "60"))
