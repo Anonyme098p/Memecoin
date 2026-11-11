@@ -53,6 +53,7 @@ async def cycle_de_vie(app: FastAPI):
     app.state.telegram = application
 
     tache_surveillance = asyncio.create_task(surveillance.boucle(application))
+    tache_hebdo = asyncio.create_task(wallets.boucle_hebdomadaire(application))  # analyse du dimanche
 
     # On remet le webhook Helius à jour (le domaine ou la liste des wallets a pu changer).
     # S'il existe déjà un webhook pour PUBLIC_URL/helius, il est modifié : jamais de doublon.
@@ -69,11 +70,12 @@ async def cycle_de_vie(app: FastAPI):
 
     # --- Arrêt (redéploiement, Ctrl+C...) ---
     log.info("Arrêt en cours...")
-    tache_surveillance.cancel()
-    try:
-        await tache_surveillance
-    except asyncio.CancelledError:
-        pass
+    for tache in (tache_surveillance, tache_hebdo):
+        tache.cancel()
+        try:
+            await tache
+        except asyncio.CancelledError:
+            pass
     await application.updater.stop()
     await application.stop()
     await application.shutdown()

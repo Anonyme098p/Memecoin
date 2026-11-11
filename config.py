@@ -91,6 +91,16 @@ HELIUS_TRANSACTION_TYPES: list[str] = [
 SIGNAL_FORT_MIN_WALLETS: int = int(os.getenv("SIGNAL_FORT_MIN_WALLETS", "2"))
 SIGNAL_FORT_MINUTES: int = int(os.getenv("SIGNAL_FORT_MINUTES", "10"))
 
+# --- Analyse d'historique des wallets ---
+# Nombre de jours d'historique analysés
+ANALYSE_JOURS: int = int(os.getenv("ANALYSE_JOURS", "30"))
+# Nombre maximum de pages de 100 transactions lues par analyse (chaque page coûte des crédits Helius)
+ANALYSE_MAX_PAGES: int = int(os.getenv("ANALYSE_MAX_PAGES", "10"))
+# Analyse automatique de tous les wallets suivis chaque dimanche, à partir de cette heure
+ANALYSE_HEBDO_HEURE: int = int(os.getenv("ANALYSE_HEBDO_HEURE", "10"))
+# Fuseau horaire utilisé pour "dimanche à 10 h"
+FUSEAU_HORAIRE: str = os.getenv("FUSEAU_HORAIRE", "Europe/Paris").strip()
+
 # --- Divers ---
 # Intervalle (en secondes) entre deux tours de la boucle de surveillance
 INTERVALLE_SURVEILLANCE: int = int(os.getenv("INTERVALLE_SURVEILLANCE", "60"))

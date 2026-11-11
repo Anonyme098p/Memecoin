@@ -7,3 +7,5 @@ uvicorn==0.54.0
 python-dotenv==1.2.4
 # Requêtes HTTP (pour appeler l'API Helius plus tard)
 httpx==0.28.1
+# Fuseaux horaires (pour l'analyse du dimanche), au cas où le serveur ne les a pas
+tzdata==2026.6

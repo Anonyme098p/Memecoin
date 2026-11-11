@@ -10,6 +10,7 @@ Tables :
   - devs_suivis      : les créateurs de tokens (devs) que l'on surveille
   - alertes_envoyees : l'historique des alertes envoyées sur Telegram (avec heure et prix)
   - achats_wallets   : chaque achat détecté sur un wallet suivi (sert au SIGNAL FORT)
+  - analyses_wallets : historique des analyses de wallets (note, verdict, rapport)
   - trades_simules   : les trades fictifs (paper trading) pour tester une stratégie
   - parametres       : petits réglages clé/valeur (ex : bot en pause ou non)
 """
@@ -85,14 +86,36 @@ CREATE TABLE IF NOT EXISTS parametres (
     valeur  TEXT NOT NULL
 );
 
+-- Historique des analyses de wallets (commande /score, ajout d'un wallet, analyse du dimanche)
+CREATE TABLE IF NOT EXISTS analyses_wallets (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    adresse             TEXT NOT NULL,
+    date_analyse        TEXT NOT NULL,
+    note                INTEGER NOT NULL,   -- de 0 à 100
+    verdict             TEXT NOT NULL,      -- SUIVRE / À SURVEILLER / ÉVITER
+    scalpeur            INTEGER NOT NULL,   -- 1 si détention médiane < 2 min
+    nb_trades           INTEGER NOT NULL,
+    taux_reussite       REAL,               -- entre 0 et 1
+    resultat_total_sol  REAL,
+    duree_mediane_s     REAL,               -- durée de détention médiane, en secondes
+    rapport             TEXT NOT NULL       -- le message envoyé sur Telegram
+);
+
 -- Index pour accélérer les recherches
 CREATE INDEX IF NOT EXISTS idx_alertes_token ON alertes_envoyees (token_adresse);
 CREATE INDEX IF NOT EXISTS idx_achats_token ON achats_wallets (token_adresse, horodatage);
+CREATE INDEX IF NOT EXISTS idx_analyses_adresse ON analyses_wallets (adresse, date_analyse);
 """
 
 # Colonnes ajoutées après la première version : si ta base existe déjà sur Railway,
 # init_db() les ajoute automatiquement (sans rien effacer).
 COLONNES_AJOUTEES = {
+    "wallets_suivis": {
+        "note": "INTEGER",          # dernière note d'analyse (0 à 100)
+        "verdict": "TEXT",          # dernier verdict : SUIVRE / À SURVEILLER / ÉVITER
+        "scalpeur": "INTEGER",      # 1 si SCALPEUR
+        "date_analyse": "TEXT",     # date de la dernière analyse
+    },
     "alertes_envoyees": {
         "wallet_adresse": "TEXT",
         "signature": "TEXT",
@@ -200,6 +223,31 @@ def supprimer_wallet(adresse: str) -> bool:
     with connexion() as conn:
         curseur = conn.execute("DELETE FROM wallets_suivis WHERE adresse = ?", (adresse,))
         return curseur.rowcount > 0
+
+
+def lire_wallet(adresse: str) -> sqlite3.Row | None:
+    """Renvoie le wallet suivi (ou None s'il n'est pas suivi)."""
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM wallets_suivis WHERE adresse = ?", (adresse,)).fetchone()
+
+
+def enregistrer_analyse(
+    adresse: str, note: int, verdict: str, scalpeur: bool, nb_trades: int,
+    taux_reussite: float | None, resultat_total_sol: float, duree_mediane_s: float | None, rapport: str,
+) -> None:
+    """Garde l'analyse dans l'historique et met à jour la note du wallet s'il est suivi."""
+    date = maintenant()
+    with connexion() as conn:
+        conn.execute(
+            "INSERT INTO analyses_wallets (adresse, date_analyse, note, verdict, scalpeur, nb_trades, "
+            "taux_reussite, resultat_total_sol, duree_mediane_s, rapport) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (adresse, date, note, verdict, int(scalpeur), nb_trades, taux_reussite,
+             resultat_total_sol, duree_mediane_s, rapport),
+        )
+        conn.execute(
+            "UPDATE wallets_suivis SET note = ?, verdict = ?, scalpeur = ?, date_analyse = ? WHERE adresse = ?",
+            (note, verdict, int(scalpeur), date, adresse),
+        )
 
 
 def surnoms_wallets() -> dict[str, str]:

@@ -11,7 +11,11 @@ Fonctionnement :
   5. Si au moins 2 wallets suivis achètent le même token en moins de 10 minutes,
      l'alerte devient un SIGNAL FORT.
 
-Commandes Telegram : /addwallet, /removewallet, /wallets, /webhook
+Analyse d'historique (le calcul est dans modules/analyse.py) :
+  - à chaque /addwallet, et avec /score <adresse> pour un wallet qu'on ne suit pas ;
+  - chaque dimanche pour tous les wallets suivis, avec une alerte si l'un d'eux passe en ÉVITER.
+
+Commandes Telegram : /addwallet, /removewallet, /wallets, /webhook, /score
 """
 
 import asyncio
@@ -19,8 +23,8 @@ import html
 import logging
 import math
 import re
-import time
-from collections import defaultdict
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
@@ -30,27 +34,18 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 import config
 import db
 import telegram_bot
-from modules import helius, tokens
+from modules import analyse, helius, tokens, transactions
 
 log = logging.getLogger(__name__)
-
-# Adresse du SOL "emballé" (wrapped SOL), utilisé par les DEX à la place du SOL natif
-MINT_WSOL = "So11111111111111111111111111111111111111112"
-
-# Tokens qui ne sont PAS des memecoins : recevoir l'un d'eux n'est pas un "achat"
-MINTS_DE_BASE = {
-    MINT_WSOL,
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KConky1jhcEdGnyR4sGq",  # USDT
-}
-
-LAMPORTS_PAR_SOL = 1_000_000_000  # 1 SOL = 1 milliard de lamports
 
 # Une adresse Solana : 32 à 44 caractères en "base58" (pas de 0, O, I ni l)
 FORMAT_ADRESSE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 # Empêche deux mises à jour du webhook en même temps
 _verrou_webhook = asyncio.Lock()
+
+# Si l'analyse d'un wallet dure plus que ça (secondes), on prévient « Analyse en cours… »
+DELAI_MESSAGE_ATTENTE = 2
 
 
 def adresse_valide(adresse: str) -> bool:
@@ -262,61 +257,13 @@ class Achat:
         return self.montant_sol / self.tokens_recus
 
 
-def _sol_depenses(wallet: str, transaction: dict, wsol_net: float) -> float:
-    """
-    Combien de SOL le wallet a dépensé dans cette transaction ?
-    On essaie plusieurs sources, de la plus précise à la moins précise.
-    """
-    # 1. Helius a reconnu un swap et donne directement le SOL entré
-    swap = (transaction.get("events") or {}).get("swap") or {}
-    entree = swap.get("nativeInput") or {}
-    if entree.get("account") == wallet and entree.get("amount"):
-        return float(entree["amount"]) / LAMPORTS_PAR_SOL
-
-    # 2. Le wallet a envoyé du SOL "emballé" (WSOL) : cas des swaps Jupiter / Raydium
-    if wsol_net < 0:
-        return -wsol_net
-
-    # 3. Le wallet a envoyé du SOL natif : cas de pump.fun par exemple
-    #    (peut inclure de petits frais de plateforme : c'est une estimation)
-    lamports = 0
-    for transfert in transaction.get("nativeTransfers") or []:
-        montant = int(transfert.get("amount") or 0)
-        if transfert.get("fromUserAccount") == wallet:
-            lamports += montant
-        if transfert.get("toUserAccount") == wallet:
-            lamports -= montant
-    return max(lamports, 0) / LAMPORTS_PAR_SOL
-
-
 def detecter_achats(transaction: dict, wallets_suivis: set[str]) -> list[Achat]:
     """Renvoie la liste des achats (SOL -> token) faits par nos wallets dans cette transaction."""
     achats = []
-    signature = transaction.get("signature") or ""
-    horodatage = int(transaction.get("timestamp") or time.time())
-    transferts = transaction.get("tokenTransfers") or []
-
     for wallet in wallets_suivis:
-        # Solde net de chaque token pour ce wallet (+ reçu, - envoyé).
-        # "tokenAmount" est déjà en unités lisibles (décimales appliquées).
-        nets: dict[str, float] = defaultdict(float)
-        for t in transferts:
-            montant = float(t.get("tokenAmount") or 0)
-            if t.get("toUserAccount") == wallet:
-                nets[t.get("mint")] += montant
-            if t.get("fromUserAccount") == wallet:
-                nets[t.get("mint")] -= montant
-
-        recus = {mint: qte for mint, qte in nets.items() if mint and qte > 0 and mint not in MINTS_DE_BASE}
-        if not recus:
-            continue  # pas de memecoin reçu : ce n'est pas un achat
-
-        sol = _sol_depenses(wallet, transaction, nets.get(MINT_WSOL, 0.0))
-        if sol <= 0:
-            continue  # token reçu sans payer en SOL (cadeau, achat en USDC...) : on ignore
-
-        mint = max(recus, key=recus.get)  # s'il y en a plusieurs, on prend le principal
-        achats.append(Achat(wallet, mint, sol, recus[mint], signature, horodatage))
+        for m in transactions.detecter_mouvements(transaction, wallet):
+            if m.sens == "achat":
+                achats.append(Achat(wallet, m.mint, m.sol, m.tokens, m.signature, m.horodatage))
     return achats
 
 
@@ -441,6 +388,117 @@ async def traiter_webhook(application: Application, transactions: list[dict]) ->
 
 
 # ---------------------------------------------------------------------------
+# Analyse d'historique : envoi du rapport et analyse du dimanche
+# ---------------------------------------------------------------------------
+
+def _enregistrer(a: analyse.Analyse, texte: str) -> None:
+    db.enregistrer_analyse(
+        a.adresse, a.note, a.verdict, a.scalpeur, len(a.trades),
+        a.taux_reussite, a.resultat_total, a.duree_mediane, texte,
+    )
+
+
+async def analyser_et_envoyer(application: Application, adresse: str, surnom: str | None = None) -> None:
+    """
+    Analyse un wallet et t'envoie le rapport.
+    Si ça prend plus de 2 secondes, on envoie d'abord « Analyse en cours… »,
+    puis ce message est remplacé par le rapport.
+    """
+    tache = asyncio.create_task(analyse.analyser_wallet(adresse))
+    attente = None
+    termine, _ = await asyncio.wait({tache}, timeout=DELAI_MESSAGE_ATTENTE)
+    if not termine:
+        nom = html.escape(surnom) if surnom else f"<code>{adresse}</code>"
+        attente = await telegram_bot.envoyer_message(
+            application, f"🔎 Analyse en cours… {nom}\n<i>Lecture des 30 derniers jours, ça peut prendre une minute.</i>"
+        )
+
+    try:
+        resultat = await tache
+        texte = analyse.rapport(resultat, surnom)
+        _enregistrer(resultat, texte)
+    except Exception as erreur:
+        log.exception("Analyse impossible pour %s", adresse)
+        texte = f"❌ Analyse impossible pour <code>{adresse}</code> : {html.escape(str(erreur))}"
+
+    if attente is not None:
+        try:
+            await attente.edit_text(texte, parse_mode=ParseMode.HTML,
+                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return
+        except Exception:
+            log.warning("Impossible de modifier le message « Analyse en cours… », envoi d'un nouveau message")
+    await telegram_bot.envoyer_message(application, texte)
+
+
+async def analyse_hebdomadaire(application: Application) -> None:
+    """Recalcule la note de chaque wallet suivi, envoie un résumé et alerte si l'un passe en ÉVITER."""
+    suivis = db.lister_wallets()
+    log.info("Analyse hebdomadaire de %d wallet(s)", len(suivis))
+    lignes = ["📅 <b>Analyse hebdomadaire des wallets suivis</b>", ""]
+    passent_en_eviter = []
+
+    for w in suivis:  # un par un, pour ménager les crédits et le débit Helius
+        nom = w["nom"] or w["adresse"][:6]
+        ancien_verdict = w["verdict"]
+        try:
+            a = await analyse.analyser_wallet(w["adresse"])
+        except Exception:
+            log.exception("Analyse hebdomadaire impossible pour %s", w["adresse"])
+            lignes.append(f"❌ <b>{html.escape(nom)}</b> : analyse impossible (voir les logs)")
+            continue
+        texte = analyse.rapport(a, nom)
+        _enregistrer(a, texte)
+
+        changement = f" <i>(avant : {ancien_verdict})</i>" if ancien_verdict and ancien_verdict != a.verdict else ""
+        lignes.append(
+            f"{analyse.EMOJI_VERDICT[a.verdict]} <b>{html.escape(nom)}</b> — {a.note}/100 {a.verdict}"
+            + (" ⚡SCALPEUR" if a.scalpeur else "") + changement
+        )
+        if a.verdict == analyse.EVITER and ancien_verdict != analyse.EVITER:
+            passent_en_eviter.append((nom, texte))
+
+    lignes.append("\n<i>Détails d'un wallet : /score &lt;adresse&gt;</i>")
+    await telegram_bot.envoyer_message(application, "\n".join(lignes))
+
+    # Une alerte séparée (avec le rapport complet) pour chaque wallet qui passe en ÉVITER
+    for nom, texte in passent_en_eviter:
+        await telegram_bot.envoyer_message(
+            application,
+            f"🔴🔴 <b>{html.escape(nom)} passe en ÉVITER</b>\n"
+            f"Pense à le retirer avec /removewallet si tu ne veux plus ses alertes.\n\n{texte}",
+        )
+
+
+async def boucle_hebdomadaire(application: Application) -> None:
+    """
+    Tourne en fond : chaque dimanche, à partir de ANALYSE_HEBDO_HEURE (heure de Paris par défaut),
+    lance l'analyse hebdomadaire une seule fois. La date de la dernière analyse est gardée en base :
+    un redémarrage du bot ne la relance donc pas.
+    """
+    fuseau = ZoneInfo(config.FUSEAU_HORAIRE)
+    log.info("Analyse hebdomadaire programmée le dimanche à partir de %d h (%s)",
+             config.ANALYSE_HEBDO_HEURE, config.FUSEAU_HORAIRE)
+    while True:
+        try:
+            maintenant = datetime.now(fuseau)
+            aujourd_hui = maintenant.date().isoformat()
+            if (
+                maintenant.weekday() == 6  # 6 = dimanche
+                and maintenant.hour >= config.ANALYSE_HEBDO_HEURE
+                and db.lire_parametre("derniere_analyse_hebdo") != aujourd_hui
+            ):
+                db.ecrire_parametre("derniere_analyse_hebdo", aujourd_hui)
+                if db.lister_wallets():
+                    await analyse_hebdomadaire(application)
+        except asyncio.CancelledError:
+            raise  # arrêt normal du bot
+        except Exception:
+            log.exception("Erreur pendant l'analyse hebdomadaire")
+        await asyncio.sleep(600)  # on revérifie toutes les 10 minutes
+
+
+# ---------------------------------------------------------------------------
 # Commandes Telegram
 # ---------------------------------------------------------------------------
 
@@ -460,6 +518,22 @@ async def cmd_addwallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"{debut} : <b>{html.escape(surnom)}</b>\n<code>{adresse}</code>\n\n{resultat}",
         parse_mode=ParseMode.HTML,
     )
+    # L'analyse tourne en arrière-plan : le bot reste disponible pour les autres commandes
+    context.application.create_task(analyser_et_envoyer(context.application, adresse, surnom), update=update)
+
+
+async def cmd_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/score <adresse> : analyse un wallet SANS l'ajouter à la liste des wallets suivis."""
+    if len(context.args) != 1:
+        await update.message.reply_text("Utilisation : /score <adresse>")
+        return
+    adresse = context.args[0]
+    if not adresse_valide(adresse):
+        await update.message.reply_text("❌ Cette adresse Solana n'est pas valide.")
+        return
+    suivi = db.lire_wallet(adresse)
+    surnom = suivi["nom"] if suivi else None
+    context.application.create_task(analyser_et_envoyer(context.application, adresse, surnom), update=update)
 
 
 async def cmd_removewallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -484,7 +558,13 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     lignes = [f"👛 <b>{len(wallets)} wallet(s) suivi(s) :</b>", ""]
     for w in wallets:
-        lignes.append(f"• <b>{html.escape(w['nom'] or '?')}</b>\n  <code>{w['adresse']}</code>")
+        if w["verdict"]:
+            note = (f" — {analyse.EMOJI_VERDICT.get(w['verdict'], '')} {w['note']}/100 {w['verdict']}"
+                    + (" ⚡" if w["scalpeur"] else ""))
+        else:
+            note = " — pas encore analysé"
+        lignes.append(f"• <b>{html.escape(w['nom'] or '?')}</b>{note}\n  <code>{w['adresse']}</code>")
+    lignes.append("\n<i>⚡ = SCALPEUR. Détails : /score &lt;adresse&gt;</i>")
 
     # Telegram limite un message à 4096 caractères : on découpe si la liste est longue
     morceau = ""
@@ -531,4 +611,5 @@ def enregistrer_commandes(application: Application) -> None:
     application.add_handler(CommandHandler("removewallet", cmd_removewallet, filters=moi))
     application.add_handler(CommandHandler("wallets", cmd_wallets, filters=moi))
     application.add_handler(CommandHandler("webhook", cmd_webhook, filters=moi))
+    application.add_handler(CommandHandler("score", cmd_score, filters=moi))
     application.add_handler(CallbackQueryHandler(bouton_ignorer, pattern="^ignorer$"))

@@ -5,7 +5,9 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 
 > **État actuel :** le suivi des wallets fonctionne. Dès qu'un wallet suivi achète un token
 > (SOL → token), tu reçois une alerte Telegram, et un **SIGNAL FORT** si plusieurs wallets
-> suivis achètent le même token en peu de temps. Le suivi des devs reste à écrire.
+> suivis achètent le même token en peu de temps. Chaque wallet est analysé (30 derniers jours)
+> et reçoit une note de 0 à 100 avec un verdict SUIVRE / À SURVEILLER / ÉVITER.
+> Le suivi des devs reste à écrire.
 
 ---
 
@@ -18,7 +20,9 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 ├── telegram_bot.py      # Le bot Telegram et ses commandes
 ├── db.py                # Base de données SQLite (tables + fonctions utiles)
 ├── modules/
-│   ├── wallets.py       # Suivi des wallets : commandes, détection des achats, alertes
+│   ├── wallets.py       # Suivi des wallets : commandes, alertes, analyse du dimanche
+│   ├── analyse.py       # Analyse d'historique : trades, statistiques, risques, note
+│   ├── transactions.py  # Lecture des transactions Helius (achats / ventes)
 │   ├── helius.py        # Appels à l'API Helius (webhook, infos d'un token)
 │   ├── tokens.py        # Nom, symbole et prix d'un token (Helius + DexScreener)
 │   ├── webhooks.py      # Routes du serveur web (FastAPI), dont /helius
@@ -39,9 +43,10 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/status` | État (actif / en pause), durée en ligne, nombre de wallets/devs suivis, alertes, trades simulés |
 | `/pause`  | Met les alertes en pause (le réglage est conservé même après un redémarrage) |
 | `/resume` | Relance les alertes |
-| `/addwallet <adresse> <surnom>` | Suit un wallet (le surnom peut contenir des espaces). Le webhook Helius est mis à jour tout seul |
+| `/addwallet <adresse> <surnom>` | Suit un wallet (le surnom peut contenir des espaces). Le webhook Helius est mis à jour tout seul, puis le wallet est analysé |
 | `/removewallet <adresse>` | Arrête de suivre un wallet (et met à jour le webhook Helius) |
-| `/wallets` | Liste des wallets suivis |
+| `/wallets` | Liste des wallets suivis, avec leur note et leur verdict |
+| `/score <adresse>` | Analyse un wallet **sans le suivre** et envoie le rapport |
 | `/webhook` | État du webhook Helius : URL, type, transactions, actif ou non, adresses synchronisées, secret identique, dernière réception |
 | `/webhook sync` | Force la resynchronisation du webhook Helius, puis affiche son état |
 
@@ -55,6 +60,7 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `devs_suivis`      | Devs (créateurs de tokens) surveillés, avec une note |
 | `alertes_envoyees` | Historique des alertes : heure, wallet, montant, **prix en SOL et en $ au moment du signal**, statut (envoyée / ignorée) |
 | `achats_wallets`   | Chaque achat détecté (même bot en pause) : sert à repérer les SIGNAUX FORTS |
+| `analyses_wallets` | Historique des analyses : note, verdict, SCALPEUR, statistiques et rapport complet |
 | `trades_simules`   | Trades fictifs : mise en SOL, prix d'entrée/sortie, gain/perte |
 | `parametres`       | Petits réglages (ex : pause on/off) |
 
@@ -71,6 +77,10 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `HELIUS_TRANSACTION_TYPES`| ❌ | Types de transactions envoyés par Helius, séparés par des virgules (défaut : `ANY`). Voir plus bas |
 | `SIGNAL_FORT_MIN_WALLETS` | ❌ | Nombre de wallets pour un SIGNAL FORT (défaut : 2) |
 | `SIGNAL_FORT_MINUTES`     | ❌ | Fenêtre de temps du SIGNAL FORT, en minutes (défaut : 10) |
+| `ANALYSE_JOURS`           | ❌ | Nombre de jours d'historique analysés (défaut : 30) |
+| `ANALYSE_MAX_PAGES`       | ❌ | Pages de 100 transactions lues au maximum par analyse (défaut : 10, soit 1 000 transactions) |
+| `ANALYSE_HEBDO_HEURE`     | ❌ | Heure de l'analyse du dimanche (défaut : 10) |
+| `FUSEAU_HORAIRE`          | ❌ | Fuseau horaire de cette heure (défaut : `Europe/Paris`) |
 | `INTERVALLE_SURVEILLANCE` | ❌ | Secondes entre deux tours de surveillance (défaut : 60) |
 | `LOG_LEVEL`               | ❌ | `DEBUG`, `INFO` (défaut), `WARNING`, `ERROR` |
 | `PORT`                    | ❌ | Fourni automatiquement par Railway, ne pas le définir |
@@ -112,6 +122,58 @@ Bon à savoir :
 - Le montant en SOL des achats pump.fun peut inclure de petits frais (c'est une estimation).
 - Chaque création ou modification du webhook consomme des crédits Helius : le bot ne contacte
   Helius que si la liste des wallets ou l'adresse a vraiment changé.
+
+---
+
+## 🔬 Analyse d'un wallet (note et verdict)
+
+L'analyse est lancée quand tu ajoutes un wallet (`/addwallet`), quand tu tapes
+`/score <adresse>` (le wallet n'est alors **pas** suivi), et chaque **dimanche à 10 h**
+pour tous les wallets suivis. Si elle dure plus de 2 secondes, le bot envoie d'abord
+« 🔎 Analyse en cours… », puis remplace ce message par le rapport.
+
+**1. Les trades.** Le bot lit les transactions des 30 derniers jours et reconstitue chaque
+trade : il commence au premier achat d'un token (en SOL) et se termine quand le wallet a tout
+revendu (ventes en plusieurs fois comprises). Il calcule le nombre de trades, le taux de
+réussite, le gain moyen, la perte moyenne, le résultat total en SOL et la durée de détention
+(médiane et moyenne). Les tokens encore détenus sont comptés comme « positions ouvertes ».
+
+**2. Les comportements à risque** (🚩 = détecté, ✅ = rien de suspect, ❔ = pas pu vérifier) :
+
+| Risque | Comment c'est détecté |
+|--------|-----------------------|
+| Sniper / initié | Il achète dans le **tout premier bloc** du token (le bloc de sa création) : soit un robot sniper, soit quelqu'un qui savait à l'avance. Signalé si c'est au moins 20 % de ses tokens |
+| Revend sur ses copieurs | Juste après son achat, une **ruée d'acheteurs** (au moins 3 en 2 minutes, plus de 2 fois le rythme normal), et il revend pendant qu'ils achètent encore. Signalé si c'est au moins 30 % de ses trades rapides et gagnants |
+| Wallet récent | Sa toute première transaction date de **moins de 14 jours** |
+
+**3. SCALPEUR.** Si la durée de détention médiane est **inférieure à 2 minutes**, le wallet est
+marqué ⚡ SCALPEUR : impossible de le copier à la main, ses alertes arrivent trop tard.
+Un SCALPEUR n'est jamais en SUIVRE.
+
+**4. La note sur 100.**
+
+| Critère | Points |
+|---------|--------|
+| Réussite (70 % de trades gagnants ou plus = maximum) | 30 |
+| Rentabilité (total des gains ÷ total des pertes ; 3 ou plus = maximum) | 30 |
+| Résultat total positif | 10 |
+| Activité (20 trades ou plus = maximum), seulement si le wallet gagne | 10 |
+| Copiabilité (détention médiane ≥ 10 min = maximum, < 2 min = 0), seulement si le wallet gagne | 20 |
+| Malus : sniper −20, revend sur ses copieurs −25, wallet récent −15 (−25 s'il a moins de 3 jours) | |
+
+**5. Le verdict.** 🟢 **SUIVRE** à partir de 65, 🟡 **À SURVEILLER** de 40 à 64, 🔴 **ÉVITER**
+en dessous de 40. Un SCALPEUR ou un wallet perdant sur la période ne peut pas être en SUIVRE.
+Avec moins de 5 trades terminés, la note est plafonnée à 50 et le verdict reste À SURVEILLER
+(sauf si un comportement à risque est détecté).
+
+**Chaque dimanche**, tu reçois un résumé (note et verdict de chaque wallet, avec l'ancien
+verdict s'il a changé). Si un wallet **passe en ÉVITER**, tu reçois en plus une alerte avec
+son rapport complet. Tous les seuils sont réglables en haut de `modules/analyse.py`.
+
+**Crédits Helius.** Une analyse lit jusqu'à 10 pages de 100 transactions (100 crédits par page
+avec l'API Enhanced Transactions), plus quelques petites requêtes `getTransactionsForAddress`
+(environ 10 crédits chacune) pour les vérifications de risques. Compte environ 1 000 à 2 000
+crédits par analyse pour un wallet actif.
 
 ---
 
@@ -234,7 +296,8 @@ Sur Telegram, envoie à ton bot :
 ```
 
 Le bot répond « ✅ Wallet ajouté » puis « 🔔 Webhook Helius à jour ». Tape `/wallets` pour
-voir la liste, et `/webhook` pour vérifier que tout est ✅. Si tu vois « ⚠️ PUBLIC_URL est
+voir la liste, et `/webhook` pour vérifier que tout est ✅. Quelques secondes plus tard, tu
+reçois le rapport d'analyse du wallet. Si tu vois « ⚠️ PUBLIC_URL est
 vide » ou « HELIUS_WEBHOOK_SECRET est vide », ajoute la variable sur Railway (étapes 7 et 9).
 
 ### Mettre à jour le bot
@@ -287,6 +350,9 @@ instance** (replica) sur Railway.
 | `❌ Erreur Helius ... 400 ... transaction type` | Vérifie `HELIUS_TRANSACTION_TYPES` (ex : `ANY` ou `SWAP,BUY`), puis `/webhook sync` |
 | `❌ Erreur Helius ... 401` | `HELIUS_API_KEY` est fausse |
 | `❌ Erreur Helius ... 429` ou limite de webhooks | Trop de requêtes, ou trop de webhooks sur ton compte Helius (5 en gratuit) : supprime les anciens sur le dashboard Helius |
+| `❌ Analyse impossible ... 401` / `403` | Clé Helius fausse, ou méthode non disponible avec ton offre Helius |
+| Risques marqués ❔ « non vérifié » | Helius n'a pas répondu à `getTransactionsForAddress` : la note est calculée sans ces vérifications (aucun malus) |
+| L'analyse du dimanche n'arrive pas | Le bot doit être allumé le dimanche après 10 h. Vérifie les logs : `Analyse hebdomadaire de N wallet(s)` |
 | Wallet ajouté mais aucune alerte | Vérifie dans les logs Railway la ligne `Webhook Helius reçu`. Si elle n'apparaît jamais, regarde les logs du webhook sur le dashboard Helius. Tape `/webhook` : tout doit être ✅. Si tu vois `Requête refusée sur /helius` dans les logs, le secret chez Helius est différent : tape `/webhook sync` |
 
 ---
@@ -297,4 +363,5 @@ instance** (replica) sur Railway.
 - Alerter aussi sur les ventes des wallets suivis.
 - Ouvrir automatiquement un trade simulé à chaque SIGNAL FORT (`db.ouvrir_trade`) pour mesurer
   la qualité des signaux.
+- Ne plus envoyer les alertes d'achat des wallets en ÉVITER (ou des SCALPEURS).
 - Toujours vérifier `db.est_en_pause()` avant d'envoyer une alerte, pour respecter `/pause`.
