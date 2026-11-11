@@ -1,0 +1,66 @@
+{
+  "_lisez_moi": [
+    "Règles de la note des tokens (0 à 100). Tu peux modifier ce fichier sans toucher au code :",
+    "il est relu à chaque analyse (pas besoin de redémarrer le bot).",
+    "",
+    "Chaque critère rapporte au maximum 'poids' points. Les poids n'ont pas besoin de faire 100 :",
+    "la note finale est ramenée sur 100.",
+    "  type 'min' : plus la valeur est HAUTE, mieux c'est. Paliers [seuil, part des points] :",
+    "               le premier palier dont la valeur atteint le seuil s'applique.",
+    "  type 'max' : plus la valeur est BASSE, mieux c'est. Le premier palier dont la valeur",
+    "               est inférieure ou égale au seuil s'applique.",
+    "  type 'oui' : tous les points si c'est vrai, aucun sinon.",
+    "Si une donnée est inconnue (API en panne, token trop récent), le critère rapporte",
+    "'part_si_inconnu' de ses points (0.5 = la moitié), et c'est indiqué dans le rapport.",
+    "",
+    "'danger' : un token qui remplit une de ces conditions est marqué DANGER, quelle que soit sa note.",
+    "'drapeaux_rouges' : seuils à partir desquels un drapeau rouge est affiché.",
+    "'bundle' : détection de faux holders financés par un même wallet.",
+    "'niveaux' : libellé affiché selon la note (du plus haut au plus bas)."
+  ],
+
+  "part_si_inconnu": 0.5,
+
+  "criteres": {
+    "liquidite_usd":         {"poids": 15, "type": "min", "paliers": [[50000, 1.0], [20000, 0.7], [5000, 0.4], [0, 0.0]]},
+    "volume_1h_usd":         {"poids": 10, "type": "min", "paliers": [[100000, 1.0], [20000, 0.7], [5000, 0.4], [0, 0.1]]},
+    "part_achats_1h":        {"poids": 5,  "type": "min", "paliers": [[0.6, 1.0], [0.5, 0.7], [0.4, 0.3], [0, 0.0]]},
+    "transactions_5min":     {"poids": 5,  "type": "min", "paliers": [[100, 1.0], [30, 0.7], [5, 0.3], [0, 0.0]]},
+    "age_minutes":           {"poids": 5,  "type": "min", "paliers": [[1440, 1.0], [60, 0.7], [10, 0.4], [0, 0.2]]},
+    "mint_revoquee":         {"poids": 15, "type": "oui"},
+    "freeze_revoquee":       {"poids": 10, "type": "oui"},
+    "liquidite_bloquee_pct": {"poids": 10, "type": "min", "paliers": [[95, 1.0], [50, 0.5], [0, 0.0]]},
+    "top10_pct":             {"poids": 15, "type": "max", "paliers": [[20, 1.0], [30, 0.7], [50, 0.3], [100, 0.0]]},
+    "createur_pct":          {"poids": 5,  "type": "max", "paliers": [[1, 1.0], [5, 0.7], [15, 0.3], [100, 0.0]]},
+    "pas_de_bundle":         {"poids": 5,  "type": "oui"}
+  },
+
+  "danger": {
+    "mint_actif": true,
+    "freeze_actif": true,
+    "createur_pct_max": 30
+  },
+
+  "drapeaux_rouges": {
+    "liquidite_usd_min": 5000,
+    "liquidite_bloquee_pct_min": 50,
+    "top10_pct_max": 50,
+    "createur_pct_max": 10,
+    "part_achats_1h_min": 0.35,
+    "age_minutes_min": 5,
+    "afficher_risques_rugcheck": ["danger"]
+  },
+
+  "bundle": {
+    "holders_verifies": 10,
+    "min_wallets_meme_financeur": 2,
+    "fenetre_heures": 24,
+    "financeurs_ignores": []
+  },
+
+  "niveaux": [
+    {"min": 70, "nom": "BON", "emoji": "🟢"},
+    {"min": 45, "nom": "MOYEN", "emoji": "🟡"},
+    {"min": 0, "nom": "FAIBLE", "emoji": "🔴"}
+  ]
+}
