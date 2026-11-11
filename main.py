@@ -19,7 +19,7 @@ from fastapi import FastAPI
 import config
 import db
 import telegram_bot
-from modules import surveillance, wallets, webhooks
+from modules import nouveaux_tokens, surveillance, wallets, webhooks
 
 # Configuration des logs (visibles dans l'onglet "Deploy Logs" de Railway)
 logging.basicConfig(
@@ -54,6 +54,12 @@ async def cycle_de_vie(app: FastAPI):
 
     tache_surveillance = asyncio.create_task(surveillance.boucle(application))
     tache_hebdo = asyncio.create_task(wallets.boucle_hebdomadaire(application))  # analyse du dimanche
+    # Nouveaux tokens pump.fun : flux temps réel, /scanall et bilan quotidien des devs suivis
+    taches_tokens = [
+        asyncio.create_task(nouveaux_tokens.ecouter(application)),
+        asyncio.create_task(nouveaux_tokens.boucle_scan(application)),
+        asyncio.create_task(nouveaux_tokens.boucle_maj_devs(application)),
+    ]
 
     # On remet le webhook Helius à jour (le domaine ou la liste des wallets a pu changer).
     # S'il existe déjà un webhook pour PUBLIC_URL/helius, il est modifié : jamais de doublon.
@@ -70,7 +76,7 @@ async def cycle_de_vie(app: FastAPI):
 
     # --- Arrêt (redéploiement, Ctrl+C...) ---
     log.info("Arrêt en cours...")
-    for tache in (tache_surveillance, tache_hebdo):
+    for tache in (tache_surveillance, tache_hebdo, *taches_tokens):
         tache.cancel()
         try:
             await tache

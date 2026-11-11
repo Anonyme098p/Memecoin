@@ -8,7 +8,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 > suivis achètent le même token en peu de temps. Chaque wallet est analysé (30 derniers jours)
 > et reçoit une note de 0 à 100 avec un verdict SUIVRE / À SURVEILLER / ÉVITER.
 > Chaque token alerté reçoit aussi une note de sécurité de 0 à 100 (DexScreener, RugCheck,
-> Helius), avec ses chiffres clés et ses drapeaux rouges. Le suivi des devs reste à écrire.
+> Helius), avec ses chiffres clés et ses drapeaux rouges. Les créations de tokens pump.fun sont
+> écoutées en temps réel : alerte PRIORITAIRE quand un dev suivi lance un token.
 
 ---
 
@@ -22,6 +23,7 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 ├── db.py                # Base de données SQLite (tables + fonctions utiles)
 ├── modules/
 │   ├── wallets.py       # Suivi des wallets : commandes, alertes, analyse du dimanche
+│   ├── nouveaux_tokens.py # Créations pump.fun en temps réel, devs suivis, /scanall, /devscore
 │   ├── analyse.py       # Note de sécurité d'un token (0 à 100), règles dans rules.json
 │   ├── analyse_wallet.py # Analyse d'historique d'un wallet : trades, statistiques, risques, note
 │   ├── transactions.py  # Interprétation d'une transaction : achat, vente ou ignorée (et pourquoi)
@@ -52,6 +54,11 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/score <adresse>` | Analyse un wallet **sans le suivre** et envoie le rapport |
 | `/check <adresse>` | Note de sécurité complète d'un token, à la demande |
 | `/minscore <0-100>` | Ne recevoir que les alertes dont la note du token atteint ce score (`/minscore 0` = tout recevoir, `/minscore` seul = voir le réglage) |
+| `/adddev <adresse> <surnom>` | Suit un créateur de tokens : alerte PRIORITAIRE dès qu'il lance un token (son bilan est calculé tout de suite) |
+| `/removedev <adresse>` | Arrête de suivre un créateur |
+| `/devs` | Liste des devs suivis avec leur bilan, état du flux pump.fun et de /scanall |
+| `/devscore <adresse>` | Bilan des lancements d'un créateur (tokens créés, réussites, rugs) et verdict SUIVRE / À SURVEILLER / ÉVITER |
+| `/scanall on <score>` / `off` | Alertes aussi pour les créateurs inconnus dont le token décolle et atteint ce score |
 | `/debugtx <adresse>` | Montre comment les 5 dernières transactions du wallet ont été comprises (achat, vente ou ignorée, et pourquoi) |
 | `/webhook` | État du webhook Helius : URL, type, transactions, actif ou non, adresses synchronisées, secret identique, dernière réception |
 | `/webhook sync` | Force la resynchronisation du webhook Helius, puis affiche son état |
@@ -63,7 +70,9 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | Table              | Contenu |
 |--------------------|---------|
 | `wallets_suivis`   | Wallets Solana surveillés (adresse, surnom) |
-| `devs_suivis`      | Devs (créateurs de tokens) surveillés, avec une note |
+| `devs_suivis`      | Devs (créateurs de tokens) surveillés |
+| `tokens_crees`     | Tokens des devs suivis ou analysés : market cap actuelle et maximale, rug |
+| `createurs`        | Bilan de chaque créateur : tokens lancés, réussites, rugs, verdict |
 | `alertes_envoyees` | Historique des alertes : heure, wallet, montant, **prix en SOL et en $ au moment du signal**, note du token, DANGER, statut (envoyée / ignorée) |
 | `achats_wallets`   | Chaque achat détecté (même bot en pause) : sert à repérer les SIGNAUX FORTS |
 | `analyses_wallets` | Historique des analyses : note, verdict, SCALPEUR, statistiques et rapport complet |
@@ -87,6 +96,11 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `ANALYSE_MAX_TRANSACTIONS`| ❌ | Transactions lues au maximum par analyse (défaut : 5000) |
 | `ANALYSE_HEBDO_HEURE`     | ❌ | Heure de l'analyse du dimanche (défaut : 10) |
 | `FUSEAU_HORAIRE`          | ❌ | Fuseau horaire de cette heure (défaut : `Europe/Paris`) |
+| `NOUVEAUX_TOKENS_MAX_PAR_HEURE` | ❌ | Alertes de nouveaux tokens par heure au maximum (défaut : 20 ; les devs suivis passent toujours) |
+| `SCAN_DELAI_S`            | ❌ | /scanall : délai avant de revérifier un nouveau token (défaut : 120 s) |
+| `SCAN_MC_MIN_USD` / `SCAN_TX_5MIN_MIN` | ❌ | /scanall : market cap et transactions en 5 min minimum pour qu'un token soit analysé (défaut : 10 000 $ et 20) |
+| `DEV_MAX_TOKENS_ANALYSES` | ❌ | Nombre de tokens d'un créateur dont le résultat est vérifié (défaut : 30, les plus récents) |
+| `PUMPPORTAL_WS_URL`       | ❌ | Adresse du flux temps réel (défaut : PumpPortal) |
 | `RULES_PATH`              | ❌ | Chemin du fichier de règles de la note des tokens (défaut : `rules.json` du projet) |
 | `ANALYSE_TOKEN_CACHE_S`   | ❌ | Secondes pendant lesquelles l'analyse d'un token est réutilisée (défaut : 120) |
 | `INTERVALLE_SURVEILLANCE` | ❌ | Secondes entre deux tours de surveillance (défaut : 60) |
@@ -130,6 +144,66 @@ Bon à savoir :
 - Le montant en SOL des achats pump.fun peut inclure de petits frais (c'est une estimation).
 - Chaque création ou modification du webhook consomme des crédits Helius : le bot ne contacte
   Helius que si la liste des wallets ou l'adresse a vraiment changé.
+
+---
+
+## 🆕 Nouveaux tokens pump.fun et suivi des devs
+
+Le bot reste connecté en permanence au flux gratuit **PumpPortal**, qui annonce chaque token créé
+sur pump.fun (plusieurs par minute). Si la connexion coupe, ou si le flux reste muet 2 minutes, il
+se reconnecte tout seul (après 1 s, puis 2 s, 4 s... jusqu'à 60 s). `/devs` et `/status` montrent
+l'état du flux.
+
+**Devs suivis.** Ajoute un créateur avec `/adddev <adresse> <surnom>`. Dès qu'il crée un token,
+tu reçois une alerte **⚡⚡ PRIORITAIRE** en quelques secondes :
+
+```
+⚡⚡ PRIORITAIRE — nouveau token d'un dev suivi ⚡⚡
+👤 Le Dev vient de créer un token
+🪙 MONSTERBOY — Monsterboy
+📄 Contrat : GQp4…pump
+💰 Achat initial du dev : 1.284 SOL (4.4 % du supply)
+📜 Bilan du dev : 12 token(s) lancé(s) · 3 > $100K · 1 rug(s) — 🟢 SUIVRE
+🟢 Note token : 70/100 — BON
+📊 MC … · Liq $5K · … (note du token, voir plus bas)
+🔗 pump.fun | DexScreener | GMGN | Transaction
+[ 🛒 Acheter ]  [ 🙈 Ignorer ]
+```
+
+À la seconde de sa création, un token est encore inconnu de DexScreener et de RugCheck : beaucoup
+de critères de sa note sont donc « inconnus », et c'est indiqué. Les alertes des devs suivis ne
+passent ni par `/minscore` ni par la limite par heure, mais elles respectent `/pause`.
+
+**Créateurs inconnus.** Aucune alerte, sauf si tu actives `/scanall on 60`. Chaque nouveau token est
+alors revérifié 2 minutes après sa création (DexScreener, gratuit) ; seuls ceux qui décollent
+(market cap ≥ 10 000 $ et au moins 20 transactions en 5 minutes) sont analysés, et tu reçois une
+alerte 🔭 si leur note atteint le score choisi. `/scanall` seul affiche les compteurs, `/scanall off`
+désactive.
+
+**Limite.** Au maximum **20 alertes de nouveaux tokens par heure** (réglable). Quand elle est
+atteinte, tu reçois un seul message pour le signaler ; les devs suivis passent quand même.
+
+**Bilan d'un créateur (`/devscore <adresse>`).**
+
+| Étape | Source |
+|-------|--------|
+| Liste des tokens qu'il a créés sur pump.fun | Helius (recherche côté serveur des instructions « create » dans son historique, quelques dizaines de crédits) + tokens déjà vus par le bot |
+| Market cap actuelle | DexScreener (30 tokens par requête) |
+| Plus haute market cap | GeckoTerminal (prix journaliers, gratuit mais 30 requêtes / minute) |
+| Rug | RugCheck (token signalé « rugged »), ou token monté au-dessus de 20 000 $ puis effondré de plus de 90 % |
+
+Le résultat est vérifié sur ses 30 tokens les plus récents (le nombre total de tokens lancés compte
+tout son historique) ; compte environ une minute. Les résultats sont gardés en base : un deuxième
+`/devscore` est quasi instantané, et le bilan des devs suivis est recalculé une fois par jour.
+
+Verdict (seuils dans la section `createurs` de `rules.json`) :
+- 🔴 **ÉVITER** : au moins 30 % de rugs (ou 3 rugs), ou au moins 20 tokens lancés avec moins de 5 % de réussites ;
+- 🟢 **SUIVRE** : au moins 20 % de ses tokens ont dépassé 100 000 $ de market cap, et moins de 10 % de rugs ;
+- 🟡 **À SURVEILLER** : le reste, et tout créateur avec moins de 3 tokens vérifiables.
+
+Limite à connaître : la plupart des « rugs » pump.fun sont des tokens que le dev revend avant qu'ils
+ne décollent. Ils restent sous 20 000 $ et sont comptés comme « morts sans décoller », pas comme
+rugs. Baisse `mc_min_usd` dans `rules.json` pour être plus sévère.
 
 ---
 

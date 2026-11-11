@@ -16,7 +16,13 @@
     "'danger' : un token qui remplit une de ces conditions est marqué DANGER, quelle que soit sa note.",
     "'drapeaux_rouges' : seuils à partir desquels un drapeau rouge est affiché.",
     "'bundle' : détection de faux holders financés par un même wallet.",
-    "'niveaux' : libellé affiché selon la note (du plus haut au plus bas)."
+    "'niveaux' : libellé affiché selon la note (du plus haut au plus bas).",
+    "",
+    "'createurs' : bilan des devs (commande /devscore, alertes de nouveaux tokens).",
+    "  reussite_mc_usd : un token est une réussite si sa market cap a dépassé ce montant.",
+    "  rug : un token est « rug » si RugCheck le signale, ou s'il est monté au-dessus de",
+    "        mc_min_usd puis a chuté de plus de chute_pct % depuis son plus haut.",
+    "  verdict : seuils pour SUIVRE / À SURVEILLER / ÉVITER (taux entre 0 et 1)."
   ],
 
   "part_si_inconnu": 0.5,
@@ -56,6 +62,20 @@
     "min_wallets_meme_financeur": 2,
     "fenetre_heures": 24,
     "financeurs_ignores": []
+  },
+
+  "createurs": {
+    "reussite_mc_usd": 100000,
+    "rug": {"mc_min_usd": 20000, "chute_pct": 90},
+    "verdict": {
+      "min_tokens_pour_juger": 3,
+      "eviter_si_taux_rug_au_moins": 0.3,
+      "eviter_si_nb_rugs_au_moins": 3,
+      "eviter_si_lances_au_moins": 20,
+      "et_taux_reussite_sous": 0.05,
+      "suivre_si_taux_reussite_au_moins": 0.2,
+      "et_taux_rug_sous": 0.1
+    }
   },
 
   "niveaux": [

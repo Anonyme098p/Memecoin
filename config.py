@@ -107,6 +107,18 @@ RULES_PATH: str = os.getenv("RULES_PATH", "").strip() or os.path.join(os.path.di
 # Durée (secondes) pendant laquelle l'analyse d'un token est réutilisée sans tout recalculer
 ANALYSE_TOKEN_CACHE_S: int = int(os.getenv("ANALYSE_TOKEN_CACHE_S", "120"))
 
+# --- Nouveaux tokens pump.fun (modules/nouveaux_tokens.py) ---
+# Flux temps réel des créations de tokens (gratuit, sans clé)
+PUMPPORTAL_WS_URL: str = os.getenv("PUMPPORTAL_WS_URL", "wss://pumpportal.fun/api/data").strip()
+# Nombre maximum d'alertes de nouveaux tokens par heure (les devs suivis passent toujours)
+NOUVEAUX_TOKENS_MAX_PAR_HEURE: int = int(os.getenv("NOUVEAUX_TOKENS_MAX_PAR_HEURE", "20"))
+# /scanall : délai avant de revérifier un token, et seuils pour qu'il soit analysé
+SCAN_DELAI_S: int = int(os.getenv("SCAN_DELAI_S", "120"))
+SCAN_MC_MIN_USD: float = float(os.getenv("SCAN_MC_MIN_USD", "10000"))
+SCAN_TX_5MIN_MIN: int = int(os.getenv("SCAN_TX_5MIN_MIN", "20"))
+# Nombre maximum de tokens d'un créateur dont on vérifie le résultat (/devscore)
+DEV_MAX_TOKENS_ANALYSES: int = int(os.getenv("DEV_MAX_TOKENS_ANALYSES", "30"))
+
 # --- Divers ---
 # Intervalle (en secondes) entre deux tours de la boucle de surveillance
 INTERVALLE_SURVEILLANCE: int = int(os.getenv("INTERVALLE_SURVEILLANCE", "60"))

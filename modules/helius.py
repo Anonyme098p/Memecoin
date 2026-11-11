@@ -328,3 +328,54 @@ async def solde_token(proprietaire: str, mint: str) -> int:
         info = (((compte.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
         total += int((info.get("tokenAmount") or {}).get("amount") or 0)
     return total
+
+
+# ---------------------------------------------------------------------------
+# Tokens créés par un wallet sur pump.fun (Parsed Events : scan)
+# ---------------------------------------------------------------------------
+
+URL_SCAN = "https://mainnet.helius-rpc.com/v1/parsed-events/scan"
+PROGRAMME_PUMP_FUN = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+# Début des données des instructions "create" et "create_v2" de pump.fun (identifiants Anchor)
+DISCRIMINATEURS_CREATION = ["181ec828051c0777", "d6904cec5f8b31b4"]
+
+
+async def creations_pump_fun(createur: str, max_scannees: int = 50_000) -> tuple[list[dict], bool]:
+    """
+    Cherche dans l'historique d'un wallet les transactions qui créent un token pump.fun.
+    Helius fait la recherche côté serveur : 10 crédits + 1 par tranche de 1 000 transactions lues.
+    Renvoie ([{"signature", "blockTime", ...}], complet) ; complet=False si on s'est arrêté à max_scannees.
+    """
+    corps: dict = {
+        "address": createur,
+        "match": {"programs": [{"programId": PROGRAMME_PUMP_FUN, "discriminators": DISCRIMINATEURS_CREATION}]},
+        "returnShape": "signatures",
+        "sortOrder": "desc",
+        "budget": {"maxScannedTransactions": 10_000},
+    }
+    trouvees: list[dict] = []
+    scannees = 0
+    while True:
+        reponse = await _requete("POST", URL_SCAN, corps)
+        _verifier(reponse)
+        donnees = reponse.json()
+        trouvees.extend(donnees.get("data") or [])
+        scannees += int((donnees.get("scan") or {}).get("scannedTransactions") or 10_000)
+        jeton = donnees.get("paginationToken")
+        if not jeton:
+            return trouvees, True
+        if scannees >= max_scannees:
+            return trouvees, False
+        corps = {**corps, "paginationToken": jeton}
+
+
+def mint_de_la_creation(tx: dict) -> str | None:
+    """Dans une transaction de création pump.fun, le mint est le 2e signataire (sa clé signe la création)."""
+    message = ((tx or {}).get("transaction") or {}).get("message") or {}
+    cles = [c if isinstance(c, str) else c.get("pubkey") for c in message.get("accountKeys") or []]
+    nb = (message.get("header") or {}).get("numRequiredSignatures") or 0
+    mints = {b.get("mint") for b in ((tx or {}).get("meta") or {}).get("postTokenBalances") or []}
+    for cle in cles[1:nb]:
+        if cle in mints:
+            return cle
+    return None
