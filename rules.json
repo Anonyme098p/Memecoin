@@ -22,7 +22,12 @@
     "  reussite_mc_usd : un token est une réussite si sa market cap a dépassé ce montant.",
     "  rug : un token est « rug » si RugCheck le signale, ou s'il est monté au-dessus de",
     "        mc_min_usd puis a chuté de plus de chute_pct % depuis son plus haut.",
-    "  verdict : seuils pour SUIVRE / À SURVEILLER / ÉVITER (taux entre 0 et 1)."
+    "  verdict : seuils pour SUIVRE / À SURVEILLER / ÉVITER (taux entre 0 et 1).",
+    "",
+    "'simulation' : trades simulés pour chaque alerte (commandes /stats, /journal, /positions).",
+    "  mise_sol : mise par trade ; frais_glissement_pct : frais + glissement, appliqués à l'achat ET à la vente.",
+    "  Sorties : prise de profit (hausse du prix en %), stop loss (baisse en %, nombre négatif),",
+    "  ou sortie forcée après duree_max_heures. Les prix sont vérifiés toutes les intervalle_verification_s secondes."
   ],
 
   "part_si_inconnu": 0.5,
@@ -76,6 +81,15 @@
       "suivre_si_taux_reussite_au_moins": 0.2,
       "et_taux_rug_sous": 0.1
     }
+  },
+
+  "simulation": {
+    "mise_sol": 0.05,
+    "frais_glissement_pct": 2,
+    "prise_de_profit_pct": 100,
+    "stop_loss_pct": -40,
+    "duree_max_heures": 24,
+    "intervalle_verification_s": 60
   },
 
   "niveaux": [

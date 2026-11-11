@@ -27,6 +27,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 │   ├── wallets.py       # Suivi des wallets : commandes, alertes, analyse du dimanche
 │   ├── nouveaux_tokens.py # Créations pump.fun en temps réel, devs suivis, /scanall, /devscore
 │   ├── veille.py        # Veille de canaux Telegram (compte utilisateur, lecture seule), page /tglogin
+│   ├── simulation.py    # Trades simulés : « Bot seul » contre « Mes choix », /stats, /journal, /positions
+│   ├── supervision.py   # État de chaque module, relance automatique en cas de plantage
 │   ├── analyse.py       # Note de sécurité d'un token (0 à 100), règles dans rules.json
 │   ├── analyse_wallet.py # Analyse d'historique d'un wallet : trades, statistiques, risques, note
 │   ├── transactions.py  # Interprétation d'une transaction : achat, vente ou ignorée (et pourquoi)
@@ -66,6 +68,9 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/removechannel <lien>` | Arrête de suivre un canal (lien, `@nom` ou titre) |
 | `/channels` | Canaux suivis, mode de lecture et nombre de tokens repérés |
 | `/veille` | État de la connexion du compte et nombre de messages lus depuis le démarrage |
+| `/stats` | Résultats des trades simulés : réussite, gain et perte moyens, total en SOL et en €, par type d'alerte, par wallet, et **Bot seul contre Mes choix** |
+| `/journal` | Les 10 derniers trades simulés avec leur résultat |
+| `/positions` | Les trades simulés encore ouverts |
 | `/debugtx <adresse>` | Montre comment les 5 dernières transactions du wallet ont été comprises (achat, vente ou ignorée, et pourquoi) |
 | `/webhook` | État du webhook Helius : URL, type, transactions, actif ou non, adresses synchronisées, secret identique, dernière réception |
 | `/webhook sync` | Force la resynchronisation du webhook Helius, puis affiche son état |
@@ -85,7 +90,9 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `alertes_envoyees` | Historique des alertes : heure, wallet, montant, **prix en SOL et en $ au moment du signal**, note du token, DANGER, statut (envoyée / ignorée) |
 | `achats_wallets`   | Chaque achat détecté (même bot en pause) : sert à repérer les SIGNAUX FORTS |
 | `analyses_wallets` | Historique des analyses : note, verdict, SCALPEUR, statistiques et rapport complet |
-| `trades_simules`   | Trades fictifs : mise en SOL, prix d'entrée/sortie, gain/perte |
+| `trades_simules`   | Trades simulés des deux portefeuilles : prix d'entrée et de sortie, résultat, raison de sortie |
+| `suivi_alertes`    | Prix de chaque alerte au signal, à 5 min, 1 h et 24 h, et ta décision |
+| `decisions`        | Chaque clic ✅ Accepter / 🙈 Ignorer, avec l'heure |
 | `parametres`       | Petits réglages (ex : pause on/off) |
 
 ### Variables d'environnement
@@ -157,6 +164,55 @@ Bon à savoir :
 - Le montant en SOL des achats pump.fun peut inclure de petits frais (c'est une estimation).
 - Chaque création ou modification du webhook consomme des crédits Helius : le bot ne contacte
   Helius que si la liste des wallets ou l'adresse a vraiment changé.
+
+---
+
+## 🎯 Trades simulés : le bot contre tes choix
+
+Sans dépenser un centime, le bot mesure si ses alertes (et tes choix) rapportent.
+
+**Sous chaque alerte**, trois boutons :
+- **✅ Accepter** : achat simulé dans ton portefeuille « 👤 Mes choix », au prix du moment du clic ;
+- **🙈 Ignorer** : rien n'est acheté pour toi ;
+- **🛒 Acheter sur Jupiter** : le vrai achat, si tu veux le faire toi-même (rien d'automatique).
+
+Chaque clic est enregistré avec l'heure. Une fois décidé, Accepter et Ignorer disparaissent.
+
+**Deux portefeuilles séparés :**
+- **🤖 Bot seul** achète **toutes** les alertes dont la note du token atteint `/minscore` (un token
+  DANGER compte pour 0 ; une note inconnue n'est achetée que si `/minscore` vaut 0) ;
+- **👤 Mes choix** n'achète que les alertes que tu acceptes.
+
+**Règles de chaque trade simulé** (section `simulation` de `rules.json`, modifiable sans redémarrer) :
+
+| Réglage | Défaut |
+|---------|--------|
+| Mise | 0,05 SOL |
+| Frais + glissement | 2 % à l'achat **et** 2 % à la vente |
+| Prise de profit | quand le prix a monté de +100 % |
+| Stop loss | quand le prix a baissé de 40 % |
+| Sortie forcée | après 24 h (au dernier prix connu) |
+| Vérification des prix | toutes les 60 s (DexScreener) |
+
+**Prix de chaque alerte.** Pour **toutes** les alertes, même ignorées, le bot relève le prix au
+signal, puis à 5 min, 1 h et 24 h. `/stats` s'en sert pour te montrer, par type d'alerte, ce que
+fait le prix après l'alerte, et combien ont fait les alertes que tu as ignorées.
+
+**`/stats`** compare côte à côte Bot seul et Mes choix (trades terminés, en cours, réussite, gain
+moyen, perte moyenne, résultat en SOL et en euros), puis détaille par type d'alerte (wallet,
+signal fort, dev, scanall, canal) et par wallet suivi. **`/journal`** montre les 10 derniers trades
+terminés, **`/positions`** ceux encore ouverts (avec leur résultat s'ils étaient vendus maintenant).
+
+Bon à savoir :
+- Le prix d'entrée est le prix du marché au moment de l'alerte (ou du clic), plus les frais. Un
+  token pas encore listé sur DexScreener (création pump.fun) est acheté dès qu'il a un prix ; sans
+  prix pendant 15 min, le trade est annulé.
+- Les résultats sont calculés à partir du prix en dollars du token : les variations du SOL lui-même
+  sont ignorées. Les euros viennent du cours SOL/€ de CoinGecko.
+- Les prix sont vérifiés toutes les minutes : un pic très court entre deux vérifications n'est pas vu.
+- Une alerte sur le même token deux fois (ex : puis en SIGNAL FORT) donne deux trades simulés.
+- Tout est dans la base du Volume : les positions ouvertes reprennent après un redémarrage. Si le
+  bot était éteint au moment d'un relevé de prix (5 min, 1 h, 24 h), ce relevé reste vide.
 
 ---
 

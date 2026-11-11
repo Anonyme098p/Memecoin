@@ -401,11 +401,12 @@ async def _analyser(mint: str):
 
 async def _envoyer(application: Application, type_alerte: str, texte: str, creation: dict, a, createur: str) -> None:
     message = await telegram_bot.envoyer_message(application, texte, wallets.boutons(creation["mint"]))
-    db.enregistrer_alerte(
+    alerte_id = db.enregistrer_alerte(
         type_alerte=type_alerte, message=texte, token_adresse=creation["mint"], wallet_adresse=createur,
         signature=creation.get("signature"), prix_usd=a.donnees.prix_usd if a else None,
         telegram_message_id=message.message_id, note_token=a.note if a else None, danger=a.danger if a else None,
     )
+    wallets._simuler(alerte_id, type_alerte, creation["mint"], creation.get("symbol"), createur, a)
 
 
 async def alerte_dev_suivi(application: Application, creation: dict, dev) -> None:
