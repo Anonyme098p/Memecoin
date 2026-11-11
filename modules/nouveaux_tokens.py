@@ -36,6 +36,7 @@ import config
 import db
 import telegram_bot
 from modules import analyse, helius, wallets
+from modules.supervision import marquer
 
 log = logging.getLogger(__name__)
 
@@ -523,6 +524,7 @@ async def ecouter(application: Application) -> None:
                                           ping_timeout=20, max_size=2 ** 20) as ws:
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 statut.update(connecte=True, depuis=time.time(), erreur=None)
+                marquer("flux pump.fun", "actif", "connecté à PumpPortal")
                 log.info("Connecté au flux PumpPortal des nouveaux tokens")
                 attente = 1
                 while True:
@@ -539,6 +541,7 @@ async def ecouter(application: Application) -> None:
         except Exception as erreur:
             statut.update(connecte=False, erreur=f"{type(erreur).__name__}")
             statut["reconnexions"] += 1
+            marquer("flux pump.fun", "en attente", f"connexion coupée ({type(erreur).__name__}), reconnexion dans {attente} s")
             log.warning("Flux PumpPortal coupé (%s) : reconnexion dans %d s", type(erreur).__name__, attente)
         await asyncio.sleep(attente)
         attente = min(attente * 2, 60)

@@ -79,25 +79,33 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from modules import nouveaux_tokens, veille  # import ici pour éviter une boucle d'imports
-    stats = db.statistiques()
-    etat = "⏸️ En pause" if db.est_en_pause() else "✅ Actif"
-    texte = (
-        f"<b>État :</b> {etat}\n"
-        f"<b>En ligne depuis :</b> {_duree_lisible(time.time() - HEURE_DEMARRAGE)}\n\n"
-        f"<b>Wallets suivis :</b> {stats['wallets']}\n"
-        f"<b>Devs suivis :</b> {stats['devs']}\n"
-        f"<b>Achats détectés :</b> {stats['achats']}\n"
-        f"<b>Alertes envoyées :</b> {stats['alertes']}\n"
-        f"<b>Trades simulés :</b> {stats['trades_ouverts']} ouverts, {stats['trades_fermes']} fermés\n"
-        f"<b>PnL simulé :</b> {stats['pnl_total']:+.3f} SOL\n\n"
-        f"<b>Clé Helius :</b> {config.masquer(config.HELIUS_API_KEY)}\n"
-        f"<b>Webhook :</b> {config.PUBLIC_URL + '/helius' if config.PUBLIC_URL else '⚠️ PUBLIC_URL non définie'}"
-        f" (détails : /webhook)\n"
-        f"{nouveaux_tokens.texte_statut_flux()}\n"
-        f"{html.escape(veille.texte_etat_court(), quote=False)}"
-    )
-    await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
+    """État du bot. Chaque partie est calculée à part : si l'une échoue, les autres s'affichent quand même."""
+    from modules import supervision  # import ici pour éviter une boucle d'imports
+    lignes = [f"<b>En ligne depuis :</b> {_duree_lisible(time.time() - HEURE_DEMARRAGE)}"]
+    try:
+        stats = db.statistiques()
+        lignes += [
+            f"<b>Alertes :</b> {'⏸️ en pause' if db.est_en_pause() else '✅ actives'}",
+            "",
+            f"<b>Wallets suivis :</b> {stats['wallets']} · <b>Devs suivis :</b> {stats['devs']}",
+            f"<b>Achats détectés :</b> {stats['achats']} · <b>Alertes envoyées :</b> {stats['alertes']}",
+            f"<b>Trades simulés :</b> {stats['trades_ouverts']} ouverts, {stats['trades_fermes']} fermés "
+            f"(PnL {stats['pnl_total']:+.3f} SOL)",
+        ]
+    except Exception as erreur:
+        lignes.append(f"❌ Base de données illisible ({type(erreur).__name__})")
+    lignes += ["", f"<b>Clé Helius :</b> {config.masquer(config.HELIUS_API_KEY) if config.HELIUS_API_KEY else '⚠️ manquante'}",
+               f"<b>Webhook :</b> {config.PUBLIC_URL + '/helius' if config.PUBLIC_URL else '⚠️ PUBLIC_URL non définie'}"
+               " (détails : /webhook)"]
+
+    modules = supervision.texte_status()
+    if modules:
+        lignes += ["", "<b>Modules</b>", html.escape(modules, quote=False)]
+    if config.PROBLEMES:
+        lignes += ["", "<b>⚠️ Variables à corriger sur Railway</b>"]
+        lignes += [f"• {html.escape(nom)} : {html.escape(probleme, quote=False)}" for nom, probleme in config.PROBLEMES.items()]
+    await update.message.reply_text("\n".join(lignes), parse_mode=ParseMode.HTML,
+                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -121,6 +129,22 @@ async def gestion_erreurs(update: object, context: ContextTypes.DEFAULT_TYPE) ->
 # Construction de l'application
 # ---------------------------------------------------------------------------
 
+# Commandes de chaque module : utilisées pour répondre proprement si le module ne se charge pas
+COMMANDES_MODULES = {
+    "wallets": ("wallets et alertes d'achat",
+                ["addwallet", "removewallet", "wallets", "webhook", "score", "debugtx", "check", "minscore"]),
+    "nouveaux_tokens": ("nouveaux tokens", ["adddev", "removedev", "devs", "devscore", "scanall"]),
+    "veille": ("veille Telegram", ["addchannel", "removechannel", "channels", "veille"]),
+}
+
+
+def _commande_indisponible(nom_module: str, raison: str):
+    async def repondre(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.message.reply_text(f"⏸️ Commande indisponible : le module « {nom_module} » est désactivé "
+                                        f"({raison}). Détails : /status")
+    return repondre
+
+
 def construire_application() -> Application:
     """Crée l'application Telegram et branche les commandes."""
     application = Application.builder().token(config.TELEGRAM_TOKEN).build()
@@ -131,11 +155,20 @@ def construire_application() -> Application:
     application.add_handler(CommandHandler("pause", cmd_pause, filters=SEULEMENT_MOI))
     application.add_handler(CommandHandler("resume", cmd_resume, filters=SEULEMENT_MOI))
 
-    # Commandes des modules (import ici pour éviter une boucle d'imports)
-    from modules import nouveaux_tokens, veille, wallets
-    wallets.enregistrer_commandes(application)
-    nouveaux_tokens.enregistrer_commandes(application)
-    veille.enregistrer_commandes(application)
+    # Commandes des modules. Chaque module est branché à part : si l'un ne peut pas se charger
+    # (bibliothèque manquante, erreur), ses commandes répondent qu'il est désactivé, et les autres marchent.
+    import importlib
+
+    from modules import supervision
+    for module, (nom_affiche, commandes) in COMMANDES_MODULES.items():
+        try:
+            importlib.import_module(f"modules.{module}").enregistrer_commandes(application)
+        except Exception as erreur:
+            log.exception("Commandes du module %s indisponibles", module)
+            raison = f"chargement impossible ({type(erreur).__name__} : {erreur})"[:160]
+            supervision.marquer(nom_affiche, "désactivé", raison)
+            application.add_handler(CommandHandler(commandes, _commande_indisponible(nom_affiche, raison),
+                                                   filters=SEULEMENT_MOI))
 
     application.add_error_handler(gestion_erreurs)
     return application
