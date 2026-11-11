@@ -70,6 +70,7 @@ surveillance = _importer("modules.surveillance")
 nouveaux_tokens = _importer("modules.nouveaux_tokens")
 veille = _importer("modules.veille")
 simulation = _importer("modules.simulation")
+ia = _importer("modules.ia")
 
 
 def _raison_import(nom: str) -> str:
@@ -87,7 +88,7 @@ def _lancer(app: FastAPI, nom: str, fabrique) -> None:
 
 def _desactiver_tous(raison: str) -> None:
     for nom in ("surveillance", "analyse du dimanche", "flux pump.fun", "scanall", "bilan des devs",
-                "veille Telegram", "webhook Helius", "simulation"):
+                "veille Telegram", "webhook Helius", "simulation", "IA"):
         marquer(nom, "désactivé", raison)
 
 
@@ -174,6 +175,11 @@ async def demarrer_bot(app: FastAPI) -> None:
         _lancer(app, "simulation", lambda: simulation.boucle(application))
     else:
         marquer("simulation", "désactivé", _raison_import("modules.simulation"))
+
+    if ia:  # avis IA sur les alertes + revue du dimanche (désactivé sans XAI_API_KEY / ANTHROPIC_API_KEY)
+        _lancer(app, "IA", lambda: ia.boucle_revue(application))
+    else:
+        marquer("IA", "désactivé", _raison_import("modules.ia"))
 
     # --- Webhook Helius (alertes d'achat des wallets suivis) ---
     etat_webhook = await _synchroniser_webhook()

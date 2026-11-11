@@ -77,7 +77,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/stats — résultats des trades simulés (Bot seul contre Mes choix)\n"
         "/journal — les 10 derniers trades simulés\n"
         "/positions — trades simulés encore ouverts\n"
-        "Sous chaque alerte : ✅ Accepter = achat simulé dans « Mes choix »"
+        "Sous chaque alerte : ✅ Accepter = achat simulé dans « Mes choix »\n\n"
+        "/revue — revue IA de la semaine (propositions à accepter ou refuser)\n"
+        "/rules — historique des versions des règles\n"
+        "/rollback [n] — revenir à une version des règles"
         "/webhook — état du webhook Helius (/webhook sync pour le resynchroniser)"
     )
 
@@ -140,6 +143,7 @@ COMMANDES_MODULES = {
     "nouveaux_tokens": ("nouveaux tokens", ["adddev", "removedev", "devs", "devscore", "scanall"]),
     "veille": ("veille Telegram", ["addchannel", "removechannel", "channels", "veille"]),
     "simulation": ("simulation", ["stats", "journal", "positions"]),
+    "ia": ("IA", ["revue", "rules", "rollback"]),
 }
 
 

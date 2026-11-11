@@ -255,7 +255,8 @@ async def alerter(mint: str, canaux: list) -> None:
     alerte_id = db.enregistrer_alerte("veille", texte, mint, telegram_message_id=message.message_id,
                                       prix_usd=d.prix_usd if d else None, note_token=a.note if a else None,
                                       danger=a.danger if a else None)
-    wallets._simuler(alerte_id, "veille", mint, d.symbole if d else None, None, a)
+    wallets._simuler(alerte_id, "veille", mint, d.symbole if d else None, None, a,
+                     _application, message.message_id, texte)
 
 
 # ---------------------------------------------------------------------------

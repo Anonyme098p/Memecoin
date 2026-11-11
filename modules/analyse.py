@@ -54,6 +54,12 @@ def charger_regles() -> dict:
         for cle in ("criteres", "danger", "drapeaux_rouges", "bundle", "niveaux"):
             if cle not in regles:
                 raise ValueError(f"section « {cle} » manquante")
+        # Changements acceptés (revue IA, /rollback), enregistrés dans la base : appliqués par-dessus
+        try:
+            from modules import regles as module_regles
+            regles = module_regles.appliquer(regles)
+        except Exception:
+            log.exception("Changements de règles enregistrés illisibles : rules.json utilisé tel quel")
         _regles_valides = regles
     except (OSError, ValueError) as erreur:
         log.error("rules.json illisible (%s) : on garde la version précédente", erreur)

@@ -342,13 +342,23 @@ def boutons(mint: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🛒 Acheter sur Jupiter", url=lien_jupiter(mint))],
     ])
 
-def _simuler(alerte_id, type_alerte, mint, symbole, wallet_adresse, analyse_token) -> None:
-    """Trades simulés (modules/simulation.py) : si ce module ne se charge pas, l'alerte part quand même."""
+def _simuler(alerte_id, type_alerte, mint, symbole, wallet_adresse, analyse_token,
+             application=None, message_id=None, texte=None) -> None:
+    """
+    Après l'envoi d'une alerte : trades simulés (modules/simulation.py) et avis de l'IA (modules/ia.py).
+    Chacun est protégé : si l'un ne se charge pas, l'alerte est déjà partie et le reste continue.
+    """
     try:
         from modules import simulation
         simulation.programmer(alerte_id, type_alerte, mint, symbole, wallet_adresse, analyse_token)
     except Exception:
         log.exception("Simulation indisponible pour cette alerte")
+    if application is not None and message_id and texte:
+        try:
+            from modules import ia
+            ia.programmer(application, alerte_id, message_id, texte, mint, analyse_token)
+        except Exception:
+            log.exception("Avis IA indisponible pour cette alerte")
 
 
 async def traiter_achat(application: Application, achat: Achat, surnom: str) -> None:
@@ -412,7 +422,8 @@ async def traiter_achat(application: Application, achat: Achat, surnom: str) -> 
         danger=analyse_token.danger if analyse_token else None,
     )
     _simuler(alerte_id, "signal_fort" if signal_fort else "achat_wallet", achat.mint,
-             infos.symbole or (analyse_token.donnees.symbole if analyse_token else None), achat.wallet, analyse_token)
+             infos.symbole or (analyse_token.donnees.symbole if analyse_token else None), achat.wallet, analyse_token,
+             application, message.message_id, texte)
 
 
 def score_minimum() -> int:
