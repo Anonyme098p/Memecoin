@@ -1,0 +1,13 @@
+# Secrets : ne jamais publier
+.env
+
+# Base de données locale
+data/
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
