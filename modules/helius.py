@@ -148,51 +148,106 @@ async def infos_token(mint: str) -> dict:
 # du type "... query the API again with the `before-signature` parameter set to XXXX"
 _SIGNATURE_DANS_ERREUR = re.compile(r"set to\W*([1-9A-HJ-NP-Za-km-z]{60,100})")
 
+# Les transactions récentes sont au format "version 1" : sans ce réglage, Helius ne les renvoie pas
+VERSION_MAX = 1
 
-async def historique_wallet(adresse: str, depuis: int, max_pages: int) -> tuple[list[dict], bool]:
+
+async def historique_wallet(adresse: str, depuis: int, max_transactions: int) -> tuple[list[dict], bool, str]:
     """
-    Récupère les transactions enhanced d'un wallet depuis le timestamp `depuis`
-    (de la plus récente à la plus ancienne, 100 par page).
-    Renvoie (transactions, tronque) : tronque=True si on s'est arrêté à max_pages.
-    Chaque page coûte des crédits Helius : max_pages limite la dépense.
+    Récupère les transactions d'un wallet depuis le timestamp `depuis` (de la plus récente
+    à la plus ancienne), page par page, jusqu'à `depuis` ou `max_transactions`.
+    Renvoie (transactions au format enhanced, tronque, source) ; tronque=True si on s'est
+    arrêté à max_transactions avant d'atteindre `depuis`.
+
+    Source principale : getTransactionsForAddress, filtré côté Helius sur les transactions
+    RÉUSSIES où le wallet a envoyé ou reçu un token. Indispensable pour les gros traders : leur
+    adresse apparaît dans des milliers de transactions d'autres personnes (souvent échouées),
+    qui noieraient leurs vrais trades. Coût : 10 crédits par 100 transactions.
+    Si cette méthode n'est pas disponible, on se rabat sur l'API Enhanced Transactions.
     """
+    try:
+        return await _historique_filtre(adresse, depuis, max_transactions)
+    except ErreurHelius as erreur:
+        log.warning("getTransactionsForAddress indisponible (%s) : repli sur l'API Enhanced", erreur)
+        return await _historique_enhanced(adresse, depuis, max_transactions)
+
+
+async def _historique_filtre(adresse: str, depuis: int, max_transactions: int) -> tuple[list[dict], bool, str]:
+    from modules.transactions import depuis_brute  # import ici pour éviter une boucle d'imports
+
+    filtres: dict = {"status": "succeeded", "tokenAccounts": "balanceChanged", "tokenTransfer": {}}
+    if depuis:
+        filtres["blockTime"] = {"gte": depuis}
+    options = {
+        "transactionDetails": "full", "encoding": "json", "maxSupportedTransactionVersion": VERSION_MAX,
+        "sortOrder": "desc", "limit": min(100, max_transactions), "filters": filtres,
+    }
     resultat: list[dict] = []
+    while len(resultat) < max_transactions:
+        corps = {"jsonrpc": "2.0", "id": 1, "method": "getTransactionsForAddress", "params": [adresse, options]}
+        donnees = await _appel_rpc(corps)
+        page = donnees.get("data") or []
+        resultat.extend(depuis_brute(t) for t in page)
+        jeton = donnees.get("paginationToken")
+        if not page or not jeton:
+            return resultat[:max_transactions], False, _SOURCE_FILTREE
+        options = {**options, "paginationToken": jeton}
+    return resultat[:max_transactions], True, _SOURCE_FILTREE
+
+
+_SOURCE_FILTREE = "getTransactionsForAddress (transactions réussies avec mouvement de token)"
+
+
+async def _historique_enhanced(adresse: str, depuis: int, max_transactions: int) -> tuple[list[dict], bool, str]:
+    """Repli : API Enhanced Transactions, page par page avec le paramètre before-signature."""
+    source = "API Enhanced Transactions (toutes les transactions, échecs exclus)"
+    resultat: list[dict] = []
+    vues: set[str] = set()
     avant: str | None = None
-    for _ in range(max_pages):
-        params = {"limit": 100, "gte-time": depuis}
+    lues = 0
+    while lues < max_transactions:
+        params = {"limit": 100}
         if avant:
             params["before-signature"] = avant
         reponse = await _requete("GET", URL_HISTORIQUE.format(adresse=adresse), params=params)
-
         if reponse.status_code >= 400:
             suite = _SIGNATURE_DANS_ERREUR.search(reponse.text)
             if suite and suite.group(1) != avant:
                 avant = suite.group(1)  # Helius nous dit où reprendre la recherche
                 continue
             if reponse.status_code == 404:
-                return resultat, False  # plus rien à trouver
+                return resultat, False, source
             _verifier(reponse)
 
         page = reponse.json() or []
-        page = [t for t in page if int(t.get("timestamp") or 0) >= depuis]
-        if not page:
-            return resultat, False
-        resultat.extend(page)
-        avant = page[-1].get("signature")
-        if len(page) < 100:
-            return resultat, False
-    return resultat, True
+        nouvelles = [t for t in page if t.get("signature") not in vues]
+        if not nouvelles:
+            return resultat, False, source  # fin de l'historique (ou page déjà vue)
+        for t in nouvelles:
+            vues.add(t.get("signature"))
+            lues += 1
+            if int(t.get("timestamp") or 0) < depuis:
+                return resultat, False, source  # on a atteint la limite des 30 jours
+            if not t.get("transactionError"):
+                resultat.append(t)
+        avant = nouvelles[-1].get("signature")
+    return resultat, True, source
+
+
+async def _appel_rpc(corps: dict) -> dict:
+    """Appel JSON-RPC à Helius ; renvoie "result" ou lève ErreurHelius."""
+    reponse = await _requete("POST", URL_RPC, corps)
+    _verifier(reponse)
+    donnees = reponse.json()
+    if "error" in donnees:
+        raise ErreurHelius(f"{corps.get('method')} : {str(donnees['error'])[:200]}")
+    return donnees.get("result") or {}
 
 
 async def _transactions_pour_adresse(adresse: str, options: dict) -> list[dict]:
     """Appelle getTransactionsForAddress et renvoie la liste "data"."""
     corps = {"jsonrpc": "2.0", "id": 1, "method": "getTransactionsForAddress", "params": [adresse, options]}
-    reponse = await _requete("POST", URL_RPC, corps)
-    _verifier(reponse)
-    donnees = reponse.json()
-    if "error" in donnees:
-        raise ErreurHelius(f"getTransactionsForAddress : {str(donnees['error'])[:200]}")
-    return (donnees.get("result") or {}).get("data") or []
+    return (await _appel_rpc(corps)).get("data") or []
 
 
 async def premiere_transaction(adresse: str) -> dict | None:
@@ -211,6 +266,8 @@ async def transactions_periode(adresse: str, debut: int, fin: int, limite: int =
     """Transactions complètes (format brut Solana) d'une adresse entre deux timestamps."""
     return await _transactions_pour_adresse(adresse, {
         "transactionDetails": "full",
+        "encoding": "json",
+        "maxSupportedTransactionVersion": VERSION_MAX,
         "sortOrder": "asc",
         "limit": limite,
         "filters": {"blockTime": {"gte": debut, "lte": fin}, "status": "succeeded"},

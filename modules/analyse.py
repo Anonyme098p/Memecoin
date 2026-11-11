@@ -4,15 +4,17 @@ modules/analyse.py — Analyse de l'historique d'un wallet (30 derniers jours).
 Étapes :
   1. On récupère les transactions du wallet via Helius (même format que les webhooks).
   2. On repère chaque achat (SOL -> token) et chaque vente (token -> SOL).
-  3. On reconstitue les TRADES : un trade commence au premier achat d'un token et se
-     termine quand le wallet a tout revendu.
+  3. On reconstitue les TRADES en appariant achats et ventes de chaque token selon la
+     méthode FIFO (premier acheté = premier vendu), ventes partielles comprises.
+     Un trade est terminé quand tout le token acheté a été revendu.
   4. On calcule les statistiques : taux de réussite, gain / perte moyens, résultat total,
      durée de détention.
   5. On cherche les comportements à risque :
        - achats dans le tout premier bloc du token (sniper ou initié) ;
        - reventes juste après une vague d'achats d'autres wallets (revend sur ses copieurs) ;
        - wallet créé récemment.
-  6. On donne une note de 0 à 100 et un verdict : SUIVRE / À SURVEILLER / ÉVITER.
+  6. On donne une note de 0 à 100 et un verdict : SUIVRE / À SURVEILLER / ÉVITER
+     (ou DONNÉES INSUFFISANTES s'il y a moins de 10 trades terminés).
 
 Tous les seuils sont réglables ci-dessous.
 """
@@ -22,6 +24,7 @@ import html
 import logging
 import statistics
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import config
@@ -35,7 +38,7 @@ log = logging.getLogger(__name__)
 
 SEUIL_SCALPEUR_SECONDES = 120     # détention médiane < 2 min -> SCALPEUR
 AGE_WALLET_RECENT_JOURS = 14      # wallet créé il y a moins de 14 jours -> risque
-MIN_TRADES_FIABLE = 5             # en dessous, pas assez de données pour juger
+MIN_TRADES_FIABLE = 10            # en dessous : verdict DONNÉES INSUFFISANTES, pas de note
 
 MAX_TOKENS_VERIFIES_SNIPER = 40   # nombre de tokens vérifiés pour le "premier bloc"
 MAX_TRADES_VERIFIES_COPIEURS = 20 # nombre de trades vérifiés pour les "copieurs"
@@ -45,7 +48,8 @@ NOTE_MIN_SUIVRE = 65              # note >= 65 -> SUIVRE
 NOTE_MIN_SURVEILLER = 40          # note >= 40 -> À SURVEILLER, sinon ÉVITER
 
 SUIVRE, SURVEILLER, EVITER = "SUIVRE", "À SURVEILLER", "ÉVITER"
-EMOJI_VERDICT = {SUIVRE: "🟢", SURVEILLER: "🟡", EVITER: "🔴"}
+INSUFFISANT = "DONNÉES INSUFFISANTES"
+EMOJI_VERDICT = {SUIVRE: "🟢", SURVEILLER: "🟡", EVITER: "🔴", INSUFFISANT: "⚪"}
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +64,7 @@ class Trade:
     sol_investi: float
     sol_recupere: float
     slot_achat: int       # bloc du premier achat
+    detention: float      # durée de détention moyenne des tokens (FIFO), en secondes
 
     @property
     def resultat(self) -> float:
@@ -71,28 +76,44 @@ class Trade:
         return self.resultat / self.sol_investi * 100 if self.sol_investi else 0.0
 
     @property
-    def duree(self) -> int:
+    def duree(self) -> float:
         """Durée de détention en secondes."""
-        return self.fin - self.debut
+        return self.detention
+
+
+@dataclass
+class _Lot:
+    """Un achat pas encore entièrement revendu."""
+    tokens: float      # tokens restants dans ce lot
+    cout_sol: float    # ce qu'ont coûté ces tokens restants, en SOL
+    horodatage: int    # heure de l'achat
 
 
 @dataclass
 class _Position:
-    """Un trade en cours de reconstitution."""
+    """Un trade en cours de reconstitution (tous les achats d'un token depuis que le wallet n'en avait plus)."""
     mint: str
     debut: int
     slot_achat: int
-    tokens: float = 0.0
-    max_tokens: float = 0.0
+    lots: deque = field(default_factory=deque)  # file FIFO des achats
+    tokens_achetes: float = 0.0
     sol_investi: float = 0.0
     sol_recupere: float = 0.0
+    cout_vendu: float = 0.0
+    detention_ponderee: float = 0.0  # somme de (coût vendu × durée de détention)
+
+    @property
+    def tokens_restants(self) -> float:
+        return sum(lot.tokens for lot in self.lots)
 
 
 def reconstituer_trades(mouvements: list[transactions.Mouvement]) -> tuple[list[Trade], list[_Position]]:
     """
-    Transforme la liste des achats/ventes en trades terminés.
+    Apparie achats et ventes de chaque token selon la méthode FIFO (premier acheté = premier vendu).
+      - Une vente partielle consomme le plus ancien achat d'abord.
+      - Le trade est terminé quand il reste moins de 1 % des tokens achetés (poussière).
+      - Les ventes de tokens achetés AVANT la période analysée sont ignorées (prix d'achat inconnu).
     Renvoie (trades terminés, positions encore ouvertes).
-    Les ventes de tokens achetés AVANT la période analysée sont ignorées (prix d'achat inconnu).
     """
     trades: list[Trade] = []
     positions: dict[str, _Position] = {}
@@ -103,23 +124,38 @@ def reconstituer_trades(mouvements: list[transactions.Mouvement]) -> tuple[list[
         if m.sens == "achat":
             if position is None:
                 position = positions[m.mint] = _Position(m.mint, m.horodatage, m.slot)
-            position.tokens += m.tokens
-            position.max_tokens = max(position.max_tokens, position.tokens)
+            position.lots.append(_Lot(m.tokens, m.sol, m.horodatage))
+            position.tokens_achetes += m.tokens
             position.sol_investi += m.sol
             continue
 
-        # Vente
-        if position is None or position.tokens <= 0:
-            continue  # acheté avant la période analysée : on ne connaît pas le prix d'achat
+        # --- Vente ---
+        if position is None:
+            continue  # acheté avant la période analysée
+        a_vendre = min(m.tokens, position.tokens_restants)
+        if a_vendre <= 0:
+            continue
         # S'il vend plus que ce qu'on l'a vu acheter (tokens reçus d'ailleurs), on ne compte que sa part
-        part = min(1.0, position.tokens / m.tokens)
-        position.sol_recupere += m.sol * part
-        position.tokens = max(0.0, position.tokens - m.tokens)
+        position.sol_recupere += m.sol * a_vendre / m.tokens
 
-        # Il reste moins de 1 % de la position : on considère le trade comme terminé
-        if position.tokens <= position.max_tokens * 0.01:
-            trades.append(Trade(m.mint, position.debut, m.horodatage,
-                                position.sol_investi, position.sol_recupere, position.slot_achat))
+        reste = a_vendre
+        while reste > 1e-12 and position.lots:
+            lot = position.lots[0]  # le plus ancien achat
+            pris = min(reste, lot.tokens)
+            cout = lot.cout_sol * pris / lot.tokens
+            position.cout_vendu += cout
+            position.detention_ponderee += cout * (m.horodatage - lot.horodatage)
+            lot.tokens -= pris
+            lot.cout_sol -= cout
+            reste -= pris
+            if lot.tokens <= 1e-12:
+                position.lots.popleft()
+
+        if position.tokens_restants <= position.tokens_achetes * 0.01:
+            detention = (position.detention_ponderee / position.cout_vendu if position.cout_vendu
+                         else m.horodatage - position.debut)
+            trades.append(Trade(m.mint, position.debut, m.horodatage, position.sol_investi,
+                                position.sol_recupere, position.slot_achat, detention))
             del positions[m.mint]
 
     return trades, list(positions.values())
@@ -257,7 +293,7 @@ async def _verifier_age(wallet: str) -> tuple[Risque, float | None]:
 class Analyse:
     adresse: str
     nb_transactions: int
-    jours_couverts: float
+    secondes_couvertes: float        # durée réellement couverte par l'historique lu
     historique_tronque: bool
     trades: list[Trade]
     positions_ouvertes: int
@@ -266,8 +302,9 @@ class Analyse:
     wallet_recent: Risque
     age_jours: float | None
     detail_note: dict[str, int] = field(default_factory=dict)
-    note: int = 0
-    verdict: str = SURVEILLER
+    note: int | None = None          # None si DONNÉES INSUFFISANTES
+    verdict: str = INSUFFISANT
+    source: str = ""                 # d'où vient l'historique (affiché dans le rapport)
 
     # --- Statistiques calculées à partir des trades ---
     @property
@@ -358,9 +395,10 @@ def calculer_note(a: Analyse) -> None:
         "Réussite": round(reussite), "Rentabilité": round(rentabilite), "Résultat": resultat,
         "Activité": round(activite), "Copiabilité": round(copiabilite), "Malus": -malus,
     }
-    note = max(0, min(100, sum(a.detail_note.values())))
     if a.donnees_insuffisantes:
-        note = min(note, 50)  # trop peu de trades : on reste prudent
+        a.note, a.verdict = None, INSUFFISANT  # trop peu de trades : pas de note
+        return
+    note = max(0, min(100, sum(a.detail_note.values())))
     a.note = note
 
     # Verdict
@@ -370,9 +408,6 @@ def calculer_note(a: Analyse) -> None:
         verdict = SURVEILLER
     else:
         verdict = EVITER
-    risque_detecte = a.sniper.detecte or a.copieurs.detecte or a.wallet_recent.detecte
-    if a.donnees_insuffisantes and not risque_detecte:
-        verdict = SURVEILLER  # pas assez de trades : ni bon ni mauvais, à observer
     if verdict == SUIVRE and (a.scalpeur or a.resultat_total <= 0):
         verdict = SURVEILLER  # un SCALPEUR (ou un wallet perdant) n'est jamais à SUIVRE
     a.verdict = verdict
@@ -382,14 +417,16 @@ async def analyser_wallet(adresse: str) -> Analyse:
     """Analyse complète d'un wallet. Peut prendre de quelques secondes à une minute."""
     maintenant = int(time.time())
     depuis = maintenant - config.ANALYSE_JOURS * 86400
-    historique, tronque = await helius.historique_wallet(adresse, depuis, config.ANALYSE_MAX_PAGES)
-    log.info("Analyse %s : %d transactions récupérées", adresse, len(historique))
+    historique, tronque, source = await helius.historique_wallet(adresse, depuis, config.ANALYSE_MAX_TRANSACTIONS)
+    log.info("Analyse %s : %d transactions récupérées (%s)", adresse, len(historique), source)
 
     mouvements = [m for tx in historique for m in transactions.detecter_mouvements(tx, adresse)]
     trades, positions = reconstituer_trades(mouvements)
+    log.info("Analyse %s : %d achats/ventes, %d trades terminés", adresse, len(mouvements), len(trades))
 
+    # Durée réellement couverte : 30 jours, sauf si on s'est arrêté à la limite de transactions
     plus_ancienne = min((int(t.get("timestamp") or maintenant) for t in historique), default=maintenant)
-    jours = config.ANALYSE_JOURS if not tronque else (maintenant - plus_ancienne) / 86400
+    secondes = config.ANALYSE_JOURS * 86400 if not tronque else maintenant - plus_ancienne
 
     # Les trois vérifications partent en même temps
     sniper, copieurs, (recent, age) = await asyncio.gather(
@@ -398,8 +435,8 @@ async def analyser_wallet(adresse: str) -> Analyse:
         _verifier_age(adresse),
     )
 
-    analyse = Analyse(adresse, len(historique), jours, tronque, trades, len(positions),
-                      sniper, copieurs, recent, age)
+    analyse = Analyse(adresse, len(historique), secondes, tronque, trades, len(positions),
+                      sniper, copieurs, recent, age, source=source)
     calculer_note(analyse)
     return analyse
 
@@ -421,6 +458,14 @@ def formater_duree(secondes: float | None) -> str:
     return f"{s // 86400} j {s % 86400 // 3600} h"
 
 
+def formater_periode(secondes: float) -> str:
+    """Période en heures si elle fait moins de 2 jours, sinon en jours."""
+    if secondes < 2 * 86400:
+        heures = secondes / 3600
+        return f"{heures:.0f} dernière(s) heure(s)" if heures >= 1 else f"{secondes / 60:.0f} dernières minutes"
+    return f"{secondes / 86400:.0f} derniers jours"
+
+
 def _sol(valeur: float | None) -> str:
     return "?" if valeur is None else f"{valeur:+.3f} SOL"
 
@@ -435,23 +480,26 @@ def rapport(a: Analyse, surnom: str | None = None) -> str:
     lignes = [
         f"📊 Analyse du {nom}",
         f"<code>{a.adresse}</code>",
-        f"Période : {a.jours_couverts:.0f} derniers jours — {a.nb_transactions} transactions",
+        f"Période : {formater_periode(a.secondes_couvertes)} — {a.nb_transactions} transactions lues",
     ]
     if a.historique_tronque:
-        lignes.append(f"⚠️ Wallet très actif : seules les {a.nb_transactions} dernières transactions ont été lues.")
+        lignes.append(f"⚠️ Wallet très actif : arrêt à {a.nb_transactions} transactions "
+                      f"(limite ANALYSE_MAX_TRANSACTIONS), soit les {formater_periode(a.secondes_couvertes)}.")
 
-    lignes += ["", f"{EMOJI_VERDICT[a.verdict]} <b>VERDICT : {a.verdict}</b> — note <b>{a.note}/100</b>"]
+    if a.note is None:
+        lignes += ["", f"{EMOJI_VERDICT[a.verdict]} <b>VERDICT : {a.verdict}</b> — "
+                       f"{len(a.trades)} trade(s) terminé(s), il en faut au moins {MIN_TRADES_FIABLE} pour noter"]
+    else:
+        lignes += ["", f"{EMOJI_VERDICT[a.verdict]} <b>VERDICT : {a.verdict}</b> — note <b>{a.note}/100</b>"]
     if a.scalpeur:
         lignes.append(
             f"⚡ <b>SCALPEUR</b> : détention médiane de {formater_duree(a.duree_mediane)}. "
             "Impossible à copier à la main, ses alertes arriveront trop tard."
         )
-    if a.donnees_insuffisantes:
-        lignes.append(f"ℹ️ Seulement {len(a.trades)} trade(s) terminé(s) : pas assez pour juger avec certitude.")
 
     lignes += [
         "",
-        "<b>Trades (achat → revente complète)</b>",
+        "<b>Trades (achats et ventes appariés en FIFO)</b>",
         f"• Trades terminés : {len(a.trades)}"
         + (f" (+ {a.positions_ouvertes} position(s) encore ouverte(s))" if a.positions_ouvertes else ""),
     ]
@@ -473,10 +521,12 @@ def rapport(a: Analyse, surnom: str | None = None) -> str:
         icone = "🚩" if risque.detecte else ("✅" if risque.verifie else "❔")
         lignes.append(f"{icone} {titre} : {html.escape(risque.detail, quote=False)}")
 
-    detail = " · ".join(f"{cle} {valeur}" for cle, valeur in a.detail_note.items())
+    if a.note is not None:
+        detail = " · ".join(f"{cle} {valeur}" for cle, valeur in a.detail_note.items())
+        lignes += ["", f"<i>Détail de la note : {detail}</i>"]
+    if a.source:
+        lignes.append(f"<i>Source : {html.escape(a.source, quote=False)}</i>")
     lignes += [
-        "",
-        f"<i>Détail de la note : {detail}</i>",
         f'🔗 <a href="https://gmgn.ai/sol/address/{a.adresse}">GMGN</a> | '
         f'<a href="https://solscan.io/account/{a.adresse}">Solscan</a>',
     ]
