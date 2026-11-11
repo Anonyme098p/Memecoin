@@ -15,7 +15,9 @@ Tables :
   - createurs        : bilan de chaque créateur (tokens lancés, réussites, rugs, verdict)
   - canaux_suivis    : canaux Telegram surveillés par la veille (modules/veille.py)
   - mentions_veille  : adresses de tokens repérées dans ces canaux
-  - trades_simules   : les trades fictifs (paper trading) pour tester une stratégie
+  - trades_simules   : les trades simulés (portefeuilles « Bot seul » et « Mes choix », modules/simulation.py)
+  - suivi_alertes    : prix de chaque alerte au signal, à 5 min, 1 h et 24 h
+  - decisions        : chaque clic Accepter / Ignorer, avec l'heure
   - parametres       : petits réglages clé/valeur (ex : bot en pause ou non)
 """
 
@@ -133,6 +135,29 @@ CREATE TABLE IF NOT EXISTS mentions_veille (
     UNIQUE (mint, canal_id, message_id)
 );
 
+-- Prix de chaque alerte au moment du signal puis à 5 min, 1 h et 24 h (même les alertes ignorées)
+CREATE TABLE IF NOT EXISTS suivi_alertes (
+    alerte_id       INTEGER PRIMARY KEY,   -- id dans alertes_envoyees
+    mint            TEXT NOT NULL,
+    type_alerte     TEXT NOT NULL,         -- achat_wallet, signal_fort, nouveau_token_dev, nouveau_token_scan, veille
+    wallet_adresse  TEXT,
+    cree_le         INTEGER NOT NULL,      -- heure de l'alerte (timestamp Unix)
+    prix_signal     REAL,                  -- prix en $ au moment de l'alerte
+    prix_5min       REAL,
+    prix_1h         REAL,
+    prix_24h        REAL,
+    note_token      INTEGER,
+    decision        TEXT                   -- 'acceptee', 'ignoree' ou vide
+);
+
+-- Historique des décisions (boutons Accepter / Ignorer)
+CREATE TABLE IF NOT EXISTS decisions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    alerte_id  INTEGER NOT NULL,
+    decision   TEXT NOT NULL,              -- 'accepter' ou 'ignorer'
+    date       TEXT NOT NULL               -- heure du clic (UTC)
+);
+
 CREATE TABLE IF NOT EXISTS parametres (
     cle     TEXT PRIMARY KEY,
     valeur  TEXT NOT NULL
@@ -159,11 +184,25 @@ CREATE INDEX IF NOT EXISTS idx_achats_token ON achats_wallets (token_adresse, ho
 CREATE INDEX IF NOT EXISTS idx_analyses_adresse ON analyses_wallets (adresse, date_analyse);
 CREATE INDEX IF NOT EXISTS idx_tokens_createur ON tokens_crees (createur, cree_le);
 CREATE INDEX IF NOT EXISTS idx_mentions_mint ON mentions_veille (mint, horodatage);
+CREATE INDEX IF NOT EXISTS idx_suivi_cree ON suivi_alertes (cree_le);
 """
 
 # Colonnes ajoutées après la première version : si ta base existe déjà sur Railway,
 # init_db() les ajoute automatiquement (sans rien effacer).
 COLONNES_AJOUTEES = {
+    "trades_simules": {
+        "portefeuille": "TEXT",          # 'bot' (Bot seul) ou 'moi' (Mes choix)
+        "alerte_id": "INTEGER",
+        "type_alerte": "TEXT",
+        "wallet_adresse": "TEXT",
+        "prix_entree_marche": "REAL",    # prix du marché à l'achat (prix_entree = avec frais)
+        "prix_actuel": "REAL",           # dernier prix vérifié
+        "prix_max": "REAL",              # plus haut prix vu pendant la position
+        "ouvert_le": "INTEGER",          # timestamp Unix
+        "ferme_le": "INTEGER",
+        "raison_sortie": "TEXT",         # prise de profit, stop loss, durée max...
+        "pnl_pct": "REAL",
+    },
     "wallets_suivis": {
         "note": "INTEGER",          # dernière note d'analyse (0 à 100)
         "verdict": "TEXT",          # dernier verdict : SUIVRE / À SURVEILLER / ÉVITER
@@ -579,6 +618,131 @@ def canaux_ayant_cite(mint: str, depuis: int, jusqua: int) -> list[sqlite3.Row]:
 def compter_mentions_canal(canal_id: int) -> int:
     with connexion() as conn:
         return conn.execute("SELECT COUNT(DISTINCT mint) FROM mentions_veille WHERE canal_id = ?", (canal_id,)).fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
+# Simulation : suivi des prix, décisions, positions (modules/simulation.py)
+# ---------------------------------------------------------------------------
+
+def creer_suivi_alerte(alerte_id: int, mint: str, type_alerte: str, wallet_adresse: str | None,
+                       cree_le: int, prix_signal: float | None, note_token: int | None) -> None:
+    with connexion() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO suivi_alertes (alerte_id, mint, type_alerte, wallet_adresse, cree_le, prix_signal, note_token) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (alerte_id, mint, type_alerte, wallet_adresse, cree_le, prix_signal, note_token),
+        )
+
+
+def releves_a_faire(maintenant_ts: int) -> list[sqlite3.Row]:
+    """Alertes dont un relevé (signal, 5 min, 1 h ou 24 h) est dû et pas encore fait (48 h max)."""
+    with connexion() as conn:
+        return conn.execute(
+            "SELECT * FROM suivi_alertes WHERE cree_le >= ? AND ("
+            " prix_signal IS NULL OR (prix_5min IS NULL AND cree_le <= ?)"
+            " OR (prix_1h IS NULL AND cree_le <= ?) OR (prix_24h IS NULL AND cree_le <= ?))",
+            (maintenant_ts - 48 * 3600, maintenant_ts - 300, maintenant_ts - 3600, maintenant_ts - 86400),
+        ).fetchall()
+
+
+def maj_releve(alerte_id: int, colonne: str, prix: float) -> None:
+    if colonne not in ("prix_signal", "prix_5min", "prix_1h", "prix_24h"):
+        raise ValueError(colonne)
+    with connexion() as conn:
+        conn.execute(f"UPDATE suivi_alertes SET {colonne} = ? WHERE alerte_id = ? AND {colonne} IS NULL", (prix, alerte_id))
+
+
+def alerte_par_message(telegram_message_id: int) -> sqlite3.Row | None:
+    with connexion() as conn:
+        return conn.execute(
+            "SELECT a.*, s.decision, s.type_alerte AS type_suivi FROM alertes_envoyees a "
+            "LEFT JOIN suivi_alertes s ON s.alerte_id = a.id WHERE a.telegram_message_id = ? "
+            "ORDER BY a.id DESC LIMIT 1", (telegram_message_id,)).fetchone()
+
+
+def enregistrer_decision(alerte_id: int, decision: str) -> None:
+    """Garde le clic (avec l'heure) et la décision sur l'alerte."""
+    statut = {"accepter": "acceptee", "ignorer": "ignoree"}[decision]
+    with connexion() as conn:
+        conn.execute("INSERT INTO decisions (alerte_id, decision, date) VALUES (?, ?, ?)", (alerte_id, decision, maintenant()))
+        conn.execute("UPDATE suivi_alertes SET decision = ? WHERE alerte_id = ?", (statut, alerte_id))
+        conn.execute("UPDATE alertes_envoyees SET statut = ? WHERE id = ?", (statut, alerte_id))
+
+
+def ouvrir_position(portefeuille: str, alerte_id: int | None, mint: str, symbole: str | None, type_alerte: str,
+                    wallet_adresse: str | None, mise_sol: float, prix_marche: float | None,
+                    frais_pct: float, ouvert_le: int) -> int:
+    """Ouvre une position simulée. Sans prix connu, elle reste 'en_attente' jusqu'au premier prix."""
+    with connexion() as conn:
+        curseur = conn.execute(
+            "INSERT INTO trades_simules (token_adresse, symbole, montant_sol, prix_entree, statut, date_ouverture, "
+            "portefeuille, alerte_id, type_alerte, wallet_adresse, prix_entree_marche, prix_actuel, prix_max, ouvert_le) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (mint, symbole, mise_sol, prix_marche * (1 + frais_pct / 100) if prix_marche else 0,
+             "ouvert" if prix_marche else "en_attente", maintenant(), portefeuille, alerte_id, type_alerte,
+             wallet_adresse, prix_marche, prix_marche, prix_marche, ouvert_le),
+        )
+        return curseur.lastrowid
+
+
+def fixer_prix_entree(trade_id: int, prix_marche: float, frais_pct: float) -> None:
+    with connexion() as conn:
+        conn.execute(
+            "UPDATE trades_simules SET statut = 'ouvert', prix_entree_marche = ?, prix_entree = ?, prix_actuel = ?, "
+            "prix_max = ? WHERE id = ? AND statut = 'en_attente'",
+            (prix_marche, prix_marche * (1 + frais_pct / 100), prix_marche, prix_marche, trade_id),
+        )
+
+
+def positions(statuts: tuple[str, ...] = ("ouvert", "en_attente")) -> list[sqlite3.Row]:
+    with connexion() as conn:
+        marques = ",".join("?" * len(statuts))
+        return conn.execute(f"SELECT * FROM trades_simules WHERE statut IN ({marques}) AND portefeuille IS NOT NULL "
+                            "ORDER BY ouvert_le", statuts).fetchall()
+
+
+def maj_prix_position(trade_id: int, prix: float) -> None:
+    with connexion() as conn:
+        conn.execute("UPDATE trades_simules SET prix_actuel = ?, prix_max = MAX(COALESCE(prix_max, 0), ?) WHERE id = ?",
+                     (prix, prix, trade_id))
+
+
+def fermer_position(trade_id: int, prix_marche: float | None, frais_pct: float, raison: str, ferme_le: int) -> None:
+    """Ferme une position : résultat net des frais de sortie. Sans prix (token mort), la mise est perdue."""
+    with connexion() as conn:
+        t = conn.execute("SELECT * FROM trades_simules WHERE id = ?", (trade_id,)).fetchone()
+        if t is None or t["statut"] not in ("ouvert", "en_attente"):
+            return
+        if t["statut"] == "en_attente":
+            conn.execute("UPDATE trades_simules SET statut = 'annule', raison_sortie = ?, ferme_le = ?, "
+                         "date_fermeture = ? WHERE id = ?", (raison, ferme_le, maintenant(), trade_id))
+            return
+        prix_net = (prix_marche or 0) * (1 - frais_pct / 100)
+        valeur = t["montant_sol"] * prix_net / t["prix_entree"] if t["prix_entree"] else 0
+        pnl = valeur - t["montant_sol"]
+        conn.execute(
+            "UPDATE trades_simules SET statut = 'ferme', prix_sortie = ?, pnl_sol = ?, pnl_pct = ?, raison_sortie = ?, "
+            "ferme_le = ?, date_fermeture = ?, prix_actuel = COALESCE(?, prix_actuel) WHERE id = ?",
+            (prix_marche, pnl, pnl / t["montant_sol"] * 100, raison, ferme_le, maintenant(), prix_marche, trade_id),
+        )
+
+
+def trades_fermes(portefeuille: str | None = None, limite: int | None = None) -> list[sqlite3.Row]:
+    requete = "SELECT * FROM trades_simules WHERE statut = 'ferme' AND portefeuille IS NOT NULL"
+    params: list = []
+    if portefeuille:
+        requete += " AND portefeuille = ?"
+        params.append(portefeuille)
+    requete += " ORDER BY ferme_le DESC"
+    if limite:
+        requete += f" LIMIT {int(limite)}"
+    with connexion() as conn:
+        return conn.execute(requete, params).fetchall()
+
+
+def suivis_alertes() -> list[sqlite3.Row]:
+    with connexion() as conn:
+        return conn.execute("SELECT * FROM suivi_alertes").fetchall()
 
 
 # ---------------------------------------------------------------------------

@@ -335,10 +335,20 @@ def construire_message(
 
 
 def boutons(mint: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🛒 Acheter", url=lien_jupiter(mint)),
-        InlineKeyboardButton("🙈 Ignorer", callback_data="ignorer"),
-    ]])
+    """Sous chaque alerte : ✅ Accepter (achat simulé « Mes choix »), 🙈 Ignorer, et le lien d'achat Jupiter."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Accepter", callback_data="accepter"),
+         InlineKeyboardButton("🙈 Ignorer", callback_data="ignorer")],
+        [InlineKeyboardButton("🛒 Acheter sur Jupiter", url=lien_jupiter(mint))],
+    ])
+
+def _simuler(alerte_id, type_alerte, mint, symbole, wallet_adresse, analyse_token) -> None:
+    """Trades simulés (modules/simulation.py) : si ce module ne se charge pas, l'alerte part quand même."""
+    try:
+        from modules import simulation
+        simulation.programmer(alerte_id, type_alerte, mint, symbole, wallet_adresse, analyse_token)
+    except Exception:
+        log.exception("Simulation indisponible pour cette alerte")
 
 
 async def traiter_achat(application: Application, achat: Achat, surnom: str) -> None:
@@ -388,7 +398,7 @@ async def traiter_achat(application: Application, achat: Achat, surnom: str) -> 
         log.exception("Impossible d'envoyer l'alerte d'achat sur Telegram")
         return
 
-    db.enregistrer_alerte(
+    alerte_id = db.enregistrer_alerte(
         type_alerte="signal_fort" if signal_fort else "achat_wallet",
         message=texte,
         token_adresse=achat.mint,
@@ -401,6 +411,8 @@ async def traiter_achat(application: Application, achat: Achat, surnom: str) -> 
         note_token=analyse_token.note if analyse_token else None,
         danger=analyse_token.danger if analyse_token else None,
     )
+    _simuler(alerte_id, "signal_fort" if signal_fort else "achat_wallet", achat.mint,
+             infos.symbole or (analyse_token.donnees.symbole if analyse_token else None), achat.wallet, analyse_token)
 
 
 def score_minimum() -> int:
@@ -719,18 +731,31 @@ async def cmd_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def bouton_ignorer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clic sur « Ignorer » : on marque l'alerte comme ignorée et on retire les boutons."""
+    """Clic sur « Ignorer » : décision enregistrée (avec l'heure), boutons Accepter / Ignorer retirés."""
     query = update.callback_query
     # Sécurité : on n'accepte que les clics venant de TON chat
     if query.message is None or query.message.chat.id != config.TELEGRAM_CHAT_ID:
         await query.answer()
         return
 
+    try:
+        from modules import simulation
+        deja = simulation.enregistrer_ignorer(query.message.message_id)
+    except Exception:
+        log.exception("Décision « Ignorer » non enregistrée")
+        deja = None
+    if deja:
+        await query.answer(deja)
+        return
     db.marquer_alerte_ignoree(query.message.message_id)
     await query.answer("Alerte ignorée")
+    alerte = db.alerte_par_message(query.message.message_id)
+    mint = alerte["token_adresse"] if alerte else None
     await query.edit_message_text(
         query.message.text_html + "\n\n<i>🙈 Ignorée</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Acheter sur Jupiter", url=lien_jupiter(mint))]])
+        if mint else None,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
