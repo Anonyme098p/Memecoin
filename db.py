@@ -124,6 +124,8 @@ COLONNES_AJOUTEES = {
         "prix_usd": "REAL",
         "telegram_message_id": "INTEGER",
         "statut": "TEXT NOT NULL DEFAULT 'envoyee'",
+        "note_token": "INTEGER",    # note du token (0 à 100) au moment de l'alerte
+        "danger": "INTEGER",        # 1 si le token était marqué DANGER
     },
 }
 
@@ -321,15 +323,17 @@ def enregistrer_alerte(
     prix_sol: float | None = None,
     prix_usd: float | None = None,
     telegram_message_id: int | None = None,
+    note_token: int | None = None,
+    danger: bool | None = None,
 ) -> int:
     """Enregistre une alerte envoyée (avec l'heure et le prix au moment du signal). Renvoie son id."""
     with connexion() as conn:
         curseur = conn.execute(
             "INSERT INTO alertes_envoyees (type, token_adresse, message, date_envoi, wallet_adresse, "
-            "signature, montant_sol, prix_sol, prix_usd, telegram_message_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (type_alerte, token_adresse, message, maintenant(), wallet_adresse,
-             signature, montant_sol, prix_sol, prix_usd, telegram_message_id),
+            "signature, montant_sol, prix_sol, prix_usd, telegram_message_id, note_token, danger) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (type_alerte, token_adresse, message, maintenant(), wallet_adresse, signature, montant_sol,
+             prix_sol, prix_usd, telegram_message_id, note_token, None if danger is None else int(danger)),
         )
         return curseur.lastrowid
 

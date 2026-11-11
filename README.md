@@ -7,7 +7,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 > (SOL → token), tu reçois une alerte Telegram, et un **SIGNAL FORT** si plusieurs wallets
 > suivis achètent le même token en peu de temps. Chaque wallet est analysé (30 derniers jours)
 > et reçoit une note de 0 à 100 avec un verdict SUIVRE / À SURVEILLER / ÉVITER.
-> Le suivi des devs reste à écrire.
+> Chaque token alerté reçoit aussi une note de sécurité de 0 à 100 (DexScreener, RugCheck,
+> Helius), avec ses chiffres clés et ses drapeaux rouges. Le suivi des devs reste à écrire.
 
 ---
 
@@ -21,13 +22,15 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 ├── db.py                # Base de données SQLite (tables + fonctions utiles)
 ├── modules/
 │   ├── wallets.py       # Suivi des wallets : commandes, alertes, analyse du dimanche
-│   ├── analyse.py       # Analyse d'historique : trades, statistiques, risques, note
+│   ├── analyse.py       # Note de sécurité d'un token (0 à 100), règles dans rules.json
+│   ├── analyse_wallet.py # Analyse d'historique d'un wallet : trades, statistiques, risques, note
 │   ├── transactions.py  # Interprétation d'une transaction : achat, vente ou ignorée (et pourquoi)
 │   ├── helius.py        # Appels à l'API Helius (webhook, infos d'un token)
 │   ├── tokens.py        # Nom, symbole et prix d'un token (Helius + DexScreener)
 │   ├── webhooks.py      # Routes du serveur web (FastAPI), dont /helius
 │   ├── alertes.py       # Envoi d'une alerte générique (pause, anti-doublon, historique)
 │   └── surveillance.py  # Boucle qui tourne en fond (pour de futures fonctionnalités)
+├── rules.json           # Règles de la note des tokens (poids, seuils, DANGER) : modifiable
 ├── requirements.txt     # Bibliothèques Python à installer
 ├── railway.json         # Configuration Railway
 ├── Procfile             # Commande de démarrage (alternative à railway.json)
@@ -47,6 +50,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/removewallet <adresse>` | Arrête de suivre un wallet (et met à jour le webhook Helius) |
 | `/wallets` | Liste des wallets suivis, avec leur note et leur verdict |
 | `/score <adresse>` | Analyse un wallet **sans le suivre** et envoie le rapport |
+| `/check <adresse>` | Note de sécurité complète d'un token, à la demande |
+| `/minscore <0-100>` | Ne recevoir que les alertes dont la note du token atteint ce score (`/minscore 0` = tout recevoir, `/minscore` seul = voir le réglage) |
 | `/debugtx <adresse>` | Montre comment les 5 dernières transactions du wallet ont été comprises (achat, vente ou ignorée, et pourquoi) |
 | `/webhook` | État du webhook Helius : URL, type, transactions, actif ou non, adresses synchronisées, secret identique, dernière réception |
 | `/webhook sync` | Force la resynchronisation du webhook Helius, puis affiche son état |
@@ -59,7 +64,7 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 |--------------------|---------|
 | `wallets_suivis`   | Wallets Solana surveillés (adresse, surnom) |
 | `devs_suivis`      | Devs (créateurs de tokens) surveillés, avec une note |
-| `alertes_envoyees` | Historique des alertes : heure, wallet, montant, **prix en SOL et en $ au moment du signal**, statut (envoyée / ignorée) |
+| `alertes_envoyees` | Historique des alertes : heure, wallet, montant, **prix en SOL et en $ au moment du signal**, note du token, DANGER, statut (envoyée / ignorée) |
 | `achats_wallets`   | Chaque achat détecté (même bot en pause) : sert à repérer les SIGNAUX FORTS |
 | `analyses_wallets` | Historique des analyses : note, verdict, SCALPEUR, statistiques et rapport complet |
 | `trades_simules`   | Trades fictifs : mise en SOL, prix d'entrée/sortie, gain/perte |
@@ -82,6 +87,8 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `ANALYSE_MAX_TRANSACTIONS`| ❌ | Transactions lues au maximum par analyse (défaut : 5000) |
 | `ANALYSE_HEBDO_HEURE`     | ❌ | Heure de l'analyse du dimanche (défaut : 10) |
 | `FUSEAU_HORAIRE`          | ❌ | Fuseau horaire de cette heure (défaut : `Europe/Paris`) |
+| `RULES_PATH`              | ❌ | Chemin du fichier de règles de la note des tokens (défaut : `rules.json` du projet) |
+| `ANALYSE_TOKEN_CACHE_S`   | ❌ | Secondes pendant lesquelles l'analyse d'un token est réutilisée (défaut : 120) |
 | `INTERVALLE_SURVEILLANCE` | ❌ | Secondes entre deux tours de surveillance (défaut : 60) |
 | `LOG_LEVEL`               | ❌ | `DEBUG`, `INFO` (défaut), `WARNING`, `ERROR` |
 | `PORT`                    | ❌ | Fourni automatiquement par Railway, ne pas le définir |
@@ -123,6 +130,75 @@ Bon à savoir :
 - Le montant en SOL des achats pump.fun peut inclure de petits frais (c'est une estimation).
 - Chaque création ou modification du webhook consomme des crédits Helius : le bot ne contacte
   Helius que si la liste des wallets ou l'adresse a vraiment changé.
+
+---
+
+## 🧪 Note de sécurité d'un token
+
+Chaque alerte d'achat contient maintenant, juste avant les liens :
+
+```
+🟢 Note token : 78/100 — BON
+📊 MC $120K · Liq $30K · Vol 1h $33K · Top10 22 % · Âge 3 h
+🚩 liquidité non bloquée (0 % bloquée) · RugCheck : Creator history of rugged tokens
+❔ Inconnu : Pas de bundle
+```
+
+`/check <adresse>` donne le rapport complet pour n'importe quel token.
+
+**Les données** (toutes gratuites, appelées en même temps, 2 à 6 secondes) :
+
+| Source | Ce qu'on y prend |
+|--------|------------------|
+| DexScreener | market cap, liquidité, volume 5 min et 1 h, nombre d'achats et de ventes, âge de la paire |
+| RugCheck | 20 plus gros holders (pools exclues), créateur et sa part, liquidité bloquée ou brûlée, risques connus |
+| Helius (RPC) | mint et freeze authority (source de référence) ; secours pour les holders et le créateur si RugCheck ne répond pas |
+
+**Bundle (faux holders).** Le bot regarde qui a envoyé ses premiers SOL à chacun des 10 plus
+gros holders. Si au moins 2 d'entre eux ont été financés par **le même wallet dans les mêmes
+24 heures**, c'est un bundle : une seule personne qui se fait passer pour plusieurs holders. Les
+holders signalés comme « insiders » liés entre eux par RugCheck comptent aussi. Un exchange qui
+finance beaucoup de wallets peut provoquer une fausse alerte : ajoute son adresse dans
+`financeurs_ignores` de `rules.json`.
+
+**La note** est la somme des points de chaque critère, ramenée sur 100. Tout se règle dans
+**`rules.json`** (poids, paliers, seuils), sans toucher au code et sans redémarrer : le fichier est
+relu à chaque analyse. S'il contient une erreur, le bot garde la dernière version correcte et
+l'écrit dans les logs.
+
+| Critère (défaut) | Points | Meilleure valeur |
+|------------------|-------:|------------------|
+| Liquidité | 15 | ≥ 50 000 $ |
+| Volume 1 h | 10 | ≥ 100 000 $ |
+| Part d'achats sur 1 h | 5 | ≥ 60 % |
+| Transactions sur 5 min | 5 | ≥ 100 |
+| Âge de la paire | 5 | ≥ 24 h |
+| Mint authority révoquée | 15 | oui |
+| Freeze authority révoquée | 10 | oui |
+| Liquidité bloquée ou brûlée | 10 | ≥ 95 % |
+| Top 10 holders (hors pools) | 15 | ≤ 20 % |
+| Part du créateur | 5 | ≤ 1 % |
+| Pas de bundle | 5 | oui |
+
+Niveaux : 🟢 **BON** à partir de 70, 🟡 **MOYEN** à partir de 45, 🔴 **FAIBLE** en dessous.
+
+**⛔ DANGER**, quelle que soit la note : mint authority active, freeze authority active, ou plus
+de **30 %** du supply chez le créateur.
+
+**Données indisponibles.** Si une API est en panne ou si le token est trop récent pour être
+listé, le critère s'affiche « inconnu », rapporte la moitié de ses points (`part_si_inconnu`) et
+le rapport précise quelle source a manqué et pourquoi. Si plus de la moitié des points viennent
+de critères inconnus, la note est marquée « peu fiable ».
+
+**`/minscore`.** `/minscore 60` : tu ne reçois plus que les alertes dont la note du token atteint
+60. Un token **DANGER compte pour 0** (il est donc toujours filtré dès que `/minscore` est
+au-dessus de 0). Si l'analyse a complètement échoué, l'alerte est envoyée quand même, avec
+« note inconnue » : mieux vaut une alerte sans note qu'une alerte perdue. Les achats filtrés
+restent enregistrés (ils comptent pour le SIGNAL FORT).
+
+**Crédits Helius.** Environ 1 à 3 crédits par token (autorités), plus environ 110 crédits pour la
+détection de bundle (10 holders). Les financeurs déjà vus sont mémorisés, et une analyse est
+réutilisée pendant 2 minutes.
 
 ---
 
@@ -189,7 +265,7 @@ Avec **moins de 10 trades terminés**, il n'y a pas de note : le verdict est
 
 **Chaque dimanche**, tu reçois un résumé (note et verdict de chaque wallet, avec l'ancien
 verdict s'il a changé). Si un wallet **passe en ÉVITER**, tu reçois en plus une alerte avec
-son rapport complet. Tous les seuils sont réglables en haut de `modules/analyse.py`.
+son rapport complet. Tous les seuils sont réglables en haut de `modules/analyse_wallet.py`.
 
 **Crédits Helius.** `getTransactionsForAddress` coûte 10 crédits par tranche de 100
 transactions : jusqu'à 500 crédits pour 5 000 transactions, plus quelques centaines de crédits

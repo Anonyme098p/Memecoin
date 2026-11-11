@@ -11,11 +11,13 @@ Fonctionnement :
   5. Si au moins 2 wallets suivis achètent le même token en moins de 10 minutes,
      l'alerte devient un SIGNAL FORT.
 
-Analyse d'historique (le calcul est dans modules/analyse.py) :
+Analyse d'historique (le calcul est dans modules/analyse_wallet.py) :
   - à chaque /addwallet, et avec /score <adresse> pour un wallet qu'on ne suit pas ;
   - chaque dimanche pour tous les wallets suivis, avec une alerte si l'un d'eux passe en ÉVITER.
 
-Commandes Telegram : /addwallet, /removewallet, /wallets, /webhook, /score, /debugtx
+Note de chaque token alerté (modules/analyse.py), filtre /minscore et analyse à la demande /check.
+
+Commandes Telegram : /addwallet, /removewallet, /wallets, /webhook, /score, /debugtx, /check, /minscore
 """
 
 import asyncio
@@ -34,7 +36,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 import config
 import db
 import telegram_bot
-from modules import analyse, helius, tokens, transactions
+from modules import analyse, analyse_wallet, helius, tokens, transactions
 
 log = logging.getLogger(__name__)
 
@@ -289,9 +291,11 @@ def construire_message(
     infos: tokens.InfosToken,
     acheteurs: list,
     signal_fort: bool,
+    analyse_token: "analyse.AnalyseToken | None" = None,
 ) -> str:
-    symbole = html.escape(infos.symbole or "???")
-    nom = html.escape(infos.nom or "Nom inconnu")
+    donnees = analyse_token.donnees if analyse_token else None
+    symbole = html.escape(infos.symbole or (donnees.symbole if donnees else None) or "???")
+    nom = html.escape(infos.nom or (donnees.nom if donnees else None) or "Nom inconnu")
     lignes = []
 
     if signal_fort:
@@ -315,6 +319,11 @@ def construire_message(
         for a in acheteurs:
             nom_wallet = html.escape(a["nom"] or a["wallet_adresse"][:6])
             lignes.append(f"  • {nom_wallet} — {a['total_sol']:.3f} SOL")
+
+    # Note du token, 5 chiffres clés et drapeaux rouges (modules/analyse.py)
+    lignes.append("")
+    lignes.append(analyse.bloc_alerte(analyse_token) if analyse_token
+                  else "🧪 <i>Note du token : inconnue (analyse impossible)</i>")
 
     lignes += [
         "",
@@ -352,8 +361,27 @@ async def traiter_achat(application: Application, achat: Achat, surnom: str) -> 
         log.info("Bot en pause : pas d'alerte envoyée")
         return
 
-    infos = await tokens.infos_token(achat.mint)
-    texte = construire_message(achat, surnom, infos, acheteurs, signal_fort)
+    # Infos du token et analyse de sécurité, en même temps
+    infos, resultat = await asyncio.gather(
+        tokens.infos_token(achat.mint), analyse.analyser_token(achat.mint), return_exceptions=True
+    )
+    if isinstance(infos, Exception):
+        infos = tokens.InfosToken(None, None, None)
+    analyse_token = None
+    if isinstance(resultat, Exception):
+        log.error("Analyse du token %s impossible : %s", achat.mint, resultat)
+    else:
+        analyse_token = resultat
+
+    # /minscore : on n'envoie que les alertes au-dessus du score choisi (un token DANGER compte 0).
+    # Si l'analyse a échoué, on envoie quand même (mieux vaut une alerte sans note que rien).
+    minimum = score_minimum()
+    if analyse_token and minimum and analyse_token.score_pour_filtre < minimum:
+        log.info("Alerte non envoyée : score %d < minimum %d (%s)",
+                 analyse_token.score_pour_filtre, minimum, achat.mint)
+        return
+
+    texte = construire_message(achat, surnom, infos, acheteurs, signal_fort, analyse_token)
     try:
         message = await telegram_bot.envoyer_message(application, texte, boutons(achat.mint))
     except Exception:
@@ -368,9 +396,19 @@ async def traiter_achat(application: Application, achat: Achat, surnom: str) -> 
         signature=achat.signature,
         montant_sol=achat.montant_sol,
         prix_sol=achat.prix_sol,
-        prix_usd=infos.prix_usd,
+        prix_usd=infos.prix_usd or (analyse_token.donnees.prix_usd if analyse_token else None),
         telegram_message_id=message.message_id,
+        note_token=analyse_token.note if analyse_token else None,
+        danger=analyse_token.danger if analyse_token else None,
     )
+
+
+def score_minimum() -> int:
+    """Score minimum choisi avec /minscore (0 = toutes les alertes)."""
+    try:
+        return int(db.lire_parametre("score_minimum", "0") or 0)
+    except ValueError:
+        return 0
 
 
 async def traiter_webhook(application: Application, transactions: list[dict]) -> None:
@@ -391,7 +429,7 @@ async def traiter_webhook(application: Application, transactions: list[dict]) ->
 # Analyse d'historique : envoi du rapport et analyse du dimanche
 # ---------------------------------------------------------------------------
 
-def _enregistrer(a: analyse.Analyse, texte: str) -> None:
+def _enregistrer(a: analyse_wallet.Analyse, texte: str) -> None:
     db.enregistrer_analyse(
         a.adresse, a.note, a.verdict, a.scalpeur, len(a.trades),
         a.taux_reussite, a.resultat_total, a.duree_mediane, texte,
@@ -404,7 +442,7 @@ async def analyser_et_envoyer(application: Application, adresse: str, surnom: st
     Si ça prend plus de 2 secondes, on envoie d'abord « Analyse en cours… »,
     puis ce message est remplacé par le rapport.
     """
-    tache = asyncio.create_task(analyse.analyser_wallet(adresse))
+    tache = asyncio.create_task(analyse_wallet.analyser_wallet(adresse))
     attente = None
     termine, _ = await asyncio.wait({tache}, timeout=DELAI_MESSAGE_ATTENTE)
     if not termine:
@@ -415,7 +453,7 @@ async def analyser_et_envoyer(application: Application, adresse: str, surnom: st
 
     try:
         resultat = await tache
-        texte = analyse.rapport(resultat, surnom)
+        texte = analyse_wallet.rapport(resultat, surnom)
         _enregistrer(resultat, texte)
     except Exception as erreur:
         log.exception("Analyse impossible pour %s", adresse)
@@ -442,21 +480,21 @@ async def analyse_hebdomadaire(application: Application) -> None:
         nom = w["nom"] or w["adresse"][:6]
         ancien_verdict = w["verdict"]
         try:
-            a = await analyse.analyser_wallet(w["adresse"])
+            a = await analyse_wallet.analyser_wallet(w["adresse"])
         except Exception:
             log.exception("Analyse hebdomadaire impossible pour %s", w["adresse"])
             lignes.append(f"❌ <b>{html.escape(nom)}</b> : analyse impossible (voir les logs)")
             continue
-        texte = analyse.rapport(a, nom)
+        texte = analyse_wallet.rapport(a, nom)
         _enregistrer(a, texte)
 
         changement = f" <i>(avant : {ancien_verdict})</i>" if ancien_verdict and ancien_verdict != a.verdict else ""
         note = f"{a.note}/100 " if a.note is not None else ""
         lignes.append(
-            f"{analyse.EMOJI_VERDICT[a.verdict]} <b>{html.escape(nom)}</b> — {note}{a.verdict}"
+            f"{analyse_wallet.EMOJI_VERDICT[a.verdict]} <b>{html.escape(nom)}</b> — {note}{a.verdict}"
             + (" ⚡SCALPEUR" if a.scalpeur else "") + changement
         )
-        if a.verdict == analyse.EVITER and ancien_verdict != analyse.EVITER:
+        if a.verdict == analyse_wallet.EVITER and ancien_verdict != analyse_wallet.EVITER:
             passent_en_eviter.append((nom, texte))
 
     lignes.append("\n<i>Détails d'un wallet : /score &lt;adresse&gt;</i>")
@@ -561,7 +599,7 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     for w in wallets:
         if w["verdict"]:
             sur_100 = f"{w['note']}/100 " if w["note"] is not None else ""
-            note = (f" — {analyse.EMOJI_VERDICT.get(w['verdict'], '')} {sur_100}{w['verdict']}"
+            note = (f" — {analyse_wallet.EMOJI_VERDICT.get(w['verdict'], '')} {sur_100}{w['verdict']}"
                     + (" ⚡" if w["scalpeur"] else ""))
         else:
             note = " — pas encore analysé"
@@ -614,6 +652,61 @@ def texte_debugtx(adresse: str, historique: list[dict], source: str) -> str:
     return "\n".join(lignes)
 
 
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/check <adresse> : analyse n'importe quel token à la demande."""
+    if len(context.args) != 1 or not adresse_valide(context.args[0]):
+        await update.message.reply_text("Utilisation : /check <adresse du token>")
+        return
+    context.application.create_task(verifier_et_envoyer(context.application, context.args[0]), update=update)
+
+
+async def verifier_et_envoyer(application: Application, mint: str) -> None:
+    """Analyse un token ; « Analyse en cours… » d'abord si ça prend plus de 2 secondes."""
+    tache = asyncio.create_task(analyse.analyser_token(mint))
+    attente = None
+    termine, _ = await asyncio.wait({tache}, timeout=DELAI_MESSAGE_ATTENTE)
+    if not termine:
+        attente = await telegram_bot.envoyer_message(application, f"🔎 Analyse du token en cours… <code>{mint}</code>")
+    try:
+        texte = analyse.rapport(await tache)
+    except Exception as erreur:
+        log.exception("Analyse du token %s impossible", mint)
+        texte = f"❌ Analyse impossible pour <code>{mint}</code> : {html.escape(str(erreur))}"
+    if attente is not None:
+        try:
+            await attente.edit_text(texte, parse_mode=ParseMode.HTML,
+                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return
+        except Exception:
+            log.warning("Impossible de modifier le message « Analyse en cours… »")
+    await telegram_bot.envoyer_message(application, texte)
+
+
+async def cmd_minscore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/minscore <nombre> : ne recevoir que les alertes dont la note du token atteint ce score."""
+    if not context.args:
+        actuel = score_minimum()
+        await update.message.reply_text(
+            f"Score minimum actuel : {actuel}/100" + (" (toutes les alertes)" if not actuel else "")
+            + "\nPour le changer : /minscore <0 à 100>  (0 = toutes les alertes)"
+        )
+        return
+    try:
+        valeur = int(context.args[0])
+        if not 0 <= valeur <= 100:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Utilisation : /minscore <nombre entre 0 et 100>")
+        return
+    db.ecrire_parametre("score_minimum", str(valeur))
+    if valeur:
+        texte = (f"✅ Tu ne recevras que les alertes dont la note du token est d'au moins {valeur}/100.\n"
+                 "Les tokens DANGER comptent pour 0. Si l'analyse échoue, l'alerte est envoyée quand même.")
+    else:
+        texte = "✅ Filtre désactivé : tu reçois toutes les alertes."
+    await update.message.reply_text(texte)
+
+
 async def cmd_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/webhook : affiche l'état du webhook. /webhook sync : le resynchronise d'abord."""
     texte = ""
@@ -651,4 +744,6 @@ def enregistrer_commandes(application: Application) -> None:
     application.add_handler(CommandHandler("webhook", cmd_webhook, filters=moi))
     application.add_handler(CommandHandler("score", cmd_score, filters=moi))
     application.add_handler(CommandHandler("debugtx", cmd_debugtx, filters=moi))
+    application.add_handler(CommandHandler("check", cmd_check, filters=moi))
+    application.add_handler(CommandHandler("minscore", cmd_minscore, filters=moi))
     application.add_handler(CallbackQueryHandler(bouton_ignorer, pattern="^ignorer$"))

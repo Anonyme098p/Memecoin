@@ -101,6 +101,12 @@ ANALYSE_HEBDO_HEURE: int = int(os.getenv("ANALYSE_HEBDO_HEURE", "10"))
 # Fuseau horaire utilisé pour "dimanche à 10 h"
 FUSEAU_HORAIRE: str = os.getenv("FUSEAU_HORAIRE", "Europe/Paris").strip()
 
+# --- Note des tokens ---
+# Fichier des règles de la note (poids, seuils, DANGER...). Par défaut : rules.json à côté du code.
+RULES_PATH: str = os.getenv("RULES_PATH", "").strip() or os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules.json")
+# Durée (secondes) pendant laquelle l'analyse d'un token est réutilisée sans tout recalculer
+ANALYSE_TOKEN_CACHE_S: int = int(os.getenv("ANALYSE_TOKEN_CACHE_S", "120"))
+
 # --- Divers ---
 # Intervalle (en secondes) entre deux tours de la boucle de surveillance
 INTERVALLE_SURVEILLANCE: int = int(os.getenv("INTERVALLE_SURVEILLANCE", "60"))

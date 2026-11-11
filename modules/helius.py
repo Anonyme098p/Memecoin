@@ -272,3 +272,59 @@ async def transactions_periode(adresse: str, debut: int, fin: int, limite: int =
         "limit": limite,
         "filters": {"blockTime": {"gte": debut, "lte": fin}, "status": "succeeded"},
     })
+
+
+# ---------------------------------------------------------------------------
+# Lecture de comptes (pour l'analyse d'un token)
+# ---------------------------------------------------------------------------
+
+async def _rpc_simple(methode: str, params: list) -> dict | list | None:
+    corps = {"jsonrpc": "2.0", "id": 1, "method": methode, "params": params}
+    reponse = await _requete("POST", URL_RPC, corps)
+    _verifier(reponse)
+    donnees = reponse.json()
+    if "error" in donnees:
+        raise ErreurHelius(f"{methode} : {str(donnees['error'])[:200]}")
+    return donnees.get("result")
+
+
+async def infos_mint(mint: str) -> dict | None:
+    """
+    Infos du mint (Token ou Token-2022) : {"mintAuthority", "freezeAuthority", "supply", "decimals"}.
+    Une autorité à None veut dire qu'elle a été révoquée.
+    """
+    resultat = await _rpc_simple("getAccountInfo", [mint, {"encoding": "jsonParsed"}])
+    valeur = (resultat or {}).get("value")
+    if not valeur:
+        return None
+    return ((valeur.get("data") or {}).get("parsed") or {}).get("info")
+
+
+async def plus_gros_comptes(mint: str) -> list[dict]:
+    """Les 20 plus gros comptes de tokens d'un mint : [{"address", "amount", ...}]."""
+    resultat = await _rpc_simple("getTokenLargestAccounts", [mint])
+    return (resultat or {}).get("value") or []
+
+
+async def comptes(adresses: list[str]) -> list[dict | None]:
+    """Lit plusieurs comptes d'un coup (format jsonParsed). None pour un compte inexistant."""
+    if not adresses:
+        return []
+    resultat = await _rpc_simple("getMultipleAccounts", [adresses, {"encoding": "jsonParsed"}])
+    return (resultat or {}).get("value") or []
+
+
+async def transaction(signature: str) -> dict | None:
+    """Une transaction complète (format brut Solana)."""
+    return await _rpc_simple("getTransaction", [signature, {
+        "encoding": "json", "maxSupportedTransactionVersion": VERSION_MAX}])
+
+
+async def solde_token(proprietaire: str, mint: str) -> int:
+    """Quantité brute (sans décimales) d'un token détenue par un wallet."""
+    resultat = await _rpc_simple("getTokenAccountsByOwner", [proprietaire, {"mint": mint}, {"encoding": "jsonParsed"}])
+    total = 0
+    for compte in (resultat or {}).get("value") or []:
+        info = (((compte.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+        total += int((info.get("tokenAmount") or {}).get("amount") or 0)
+    return total

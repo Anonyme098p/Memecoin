@@ -62,6 +62,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/wallets — liste des wallets suivis (avec leur note)\n"
         "/score <adresse> — analyser un wallet sans le suivre\n"
         "/debugtx <adresse> — voir comment ses 5 dernières transactions sont comprises\n"
+        "/check <adresse> — note de sécurité d'un token\n"
+        "/minscore <0-100> — ne recevoir que les alertes au-dessus de ce score\n"
         "/webhook — état du webhook Helius (/webhook sync pour le resynchroniser)"
     )
 
