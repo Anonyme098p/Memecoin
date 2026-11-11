@@ -83,9 +83,48 @@ TELEGRAM_OK: bool = bool(TELEGRAM_TOKEN) and bool(TELEGRAM_CHAT_ID)
 HELIUS_API_KEY: str = _obligatoire("HELIUS_API_KEY")
 
 # --- Base de données ---
-# Sur Railway, on pointe vers le volume persistant, par exemple /data/bot.db
-# En local, par défaut, le fichier est créé dans ./data/bot.db
-DB_PATH: str = _texte("DB_PATH", "./data/bot.db")
+# Sur Railway, le dossier du code est effacé à chaque déploiement : la base DOIT être sur le volume.
+# Ordre de choix du fichier :
+#   1. DB_PATH, si c'est un chemin absolu (commence par "/") ; un chemin relatif est ignoré ;
+#   2. sinon RAILWAY_VOLUME_MOUNT_PATH + "/bot.db" (Railway crée cette variable quand un volume est attaché) ;
+#   3. sinon ./data/bot.db, avec un avertissement (normal en local, mémoire perdue sur Railway).
+VOLUME_RAILWAY: str = _brut("RAILWAY_VOLUME_MOUNT_PATH").rstrip("/") or ("/" if _brut("RAILWAY_VOLUME_MOUNT_PATH") else "")
+SUR_RAILWAY: bool = bool(_brut("RAILWAY_ENVIRONMENT") or _brut("RAILWAY_PROJECT_ID") or _brut("RAILWAY_SERVICE_ID"))
+AVERTISSEMENTS_STOCKAGE: list[str] = []
+
+
+def _chemin_base() -> str:
+    demande = _brut("DB_PATH")
+    if demande and not demande.startswith("/"):
+        PROBLEMES["DB_PATH"] = (f"chemin relatif « {demande} » ignoré : il serait effacé à chaque déploiement "
+                                "(mets un chemin absolu sur le volume, ex : /data/bot.db, ou supprime la variable)")
+        demande = ""
+    if demande:
+        return demande
+    if VOLUME_RAILWAY:
+        return os.path.join(VOLUME_RAILWAY, "bot.db")
+    return "./data/bot.db"
+
+
+DB_PATH: str = _chemin_base()
+
+
+def _sur_le_volume(chemin: str) -> bool:
+    if not VOLUME_RAILWAY:
+        return False
+    volume = os.path.realpath(VOLUME_RAILWAY)
+    return os.path.realpath(chemin) == volume or os.path.realpath(chemin).startswith(volume.rstrip("/") + "/")
+
+
+# True si la base survivra aux redéploiements (elle est bien sur le volume Railway)
+BASE_SUR_VOLUME: bool = _sur_le_volume(DB_PATH)
+if not VOLUME_RAILWAY:
+    AVERTISSEMENTS_STOCKAGE.append(f"aucun volume Railway détecté : base dans {DB_PATH}, "
+                                   "effacée à chaque mise à jour si le bot tourne sur Railway")
+elif not BASE_SUR_VOLUME:
+    AVERTISSEMENTS_STOCKAGE.append(f"DB_PATH ({DB_PATH}) n'est pas sur le volume ({VOLUME_RAILWAY}) : "
+                                   "la base sera effacée à chaque mise à jour")
+    PROBLEMES["DB_PATH"] = f"« {DB_PATH} » n'est pas sur le volume monté sur {VOLUME_RAILWAY}"
 
 # --- Serveur web ---
 # Railway fournit automatiquement la variable PORT. En local, on utilise 8000.
