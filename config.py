@@ -94,8 +94,8 @@ SIGNAL_FORT_MINUTES: int = int(os.getenv("SIGNAL_FORT_MINUTES", "10"))
 # --- Analyse d'historique des wallets ---
 # Nombre de jours d'historique analysés
 ANALYSE_JOURS: int = int(os.getenv("ANALYSE_JOURS", "30"))
-# Nombre maximum de pages de 100 transactions lues par analyse (chaque page coûte des crédits Helius)
-ANALYSE_MAX_PAGES: int = int(os.getenv("ANALYSE_MAX_PAGES", "10"))
+# Nombre maximum de transactions lues par analyse (10 crédits Helius par tranche de 100)
+ANALYSE_MAX_TRANSACTIONS: int = int(os.getenv("ANALYSE_MAX_TRANSACTIONS", "5000"))
 # Analyse automatique de tous les wallets suivis chaque dimanche, à partir de cette heure
 ANALYSE_HEBDO_HEURE: int = int(os.getenv("ANALYSE_HEBDO_HEURE", "10"))
 # Fuseau horaire utilisé pour "dimanche à 10 h"

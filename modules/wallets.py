@@ -15,7 +15,7 @@ Analyse d'historique (le calcul est dans modules/analyse.py) :
   - à chaque /addwallet, et avec /score <adresse> pour un wallet qu'on ne suit pas ;
   - chaque dimanche pour tous les wallets suivis, avec une alerte si l'un d'eux passe en ÉVITER.
 
-Commandes Telegram : /addwallet, /removewallet, /wallets, /webhook, /score
+Commandes Telegram : /addwallet, /removewallet, /wallets, /webhook, /score, /debugtx
 """
 
 import asyncio
@@ -451,8 +451,9 @@ async def analyse_hebdomadaire(application: Application) -> None:
         _enregistrer(a, texte)
 
         changement = f" <i>(avant : {ancien_verdict})</i>" if ancien_verdict and ancien_verdict != a.verdict else ""
+        note = f"{a.note}/100 " if a.note is not None else ""
         lignes.append(
-            f"{analyse.EMOJI_VERDICT[a.verdict]} <b>{html.escape(nom)}</b> — {a.note}/100 {a.verdict}"
+            f"{analyse.EMOJI_VERDICT[a.verdict]} <b>{html.escape(nom)}</b> — {note}{a.verdict}"
             + (" ⚡SCALPEUR" if a.scalpeur else "") + changement
         )
         if a.verdict == analyse.EVITER and ancien_verdict != analyse.EVITER:
@@ -559,7 +560,8 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lignes = [f"👛 <b>{len(wallets)} wallet(s) suivi(s) :</b>", ""]
     for w in wallets:
         if w["verdict"]:
-            note = (f" — {analyse.EMOJI_VERDICT.get(w['verdict'], '')} {w['note']}/100 {w['verdict']}"
+            sur_100 = f"{w['note']}/100 " if w["note"] is not None else ""
+            note = (f" — {analyse.EMOJI_VERDICT.get(w['verdict'], '')} {sur_100}{w['verdict']}"
                     + (" ⚡" if w["scalpeur"] else ""))
         else:
             note = " — pas encore analysé"
@@ -574,6 +576,42 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             morceau = ""
         morceau += ligne + "\n"
     await update.message.reply_text(morceau, parse_mode=ParseMode.HTML)
+
+
+async def cmd_debugtx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/debugtx <adresse> : montre comment les 5 dernières transactions du wallet ont été interprétées."""
+    if len(context.args) != 1 or not adresse_valide(context.args[0]):
+        await update.message.reply_text("Utilisation : /debugtx <adresse>")
+        return
+    adresse = context.args[0]
+    try:
+        historique, _, source = await helius.historique_wallet(adresse, 0, 5)
+    except helius.ErreurHelius as erreur:
+        await update.message.reply_text(f"❌ Helius : {erreur}")
+        return
+    await update.message.reply_text(
+        texte_debugtx(adresse, historique, source),
+        parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+def texte_debugtx(adresse: str, historique: list[dict], source: str) -> str:
+    """Construit le message de /debugtx."""
+    lignes = [f"🔍 <b>{len(historique)} dernière(s) transaction(s)</b>", f"<code>{adresse}</code>",
+              f"<i>Source : {html.escape(source, quote=False)}</i>", ""]
+    if not historique:
+        lignes.append("Aucune transaction trouvée.")
+    icones = {"achat": "🟢 ACHAT", "vente": "🔴 VENTE", None: "⚪ IGNORÉE"}
+    for tx in historique:
+        i = transactions.interpreter(tx, adresse)
+        heure = datetime.fromtimestamp(i.horodatage, ZoneInfo(config.FUSEAU_HORAIRE)).strftime("%d/%m %H:%M:%S")
+        lignes.append(f'<b>{icones[i.sens]}</b> — {heure} — <a href="{lien_transaction(i.signature)}">{i.signature[:8]}…</a>')
+        lignes.append(f"  Raison : {html.escape(i.raison, quote=False)}")
+        lignes.append(f"  SOL : {i.sol:+.6f}")
+        for mint, variation in list(i.tokens.items())[:4]:
+            lignes.append(f"  Token <code>{mint[:6]}…{mint[-4:]}</code> : {variation:+,.4f}")
+        lignes.append("")
+    return "\n".join(lignes)
 
 
 async def cmd_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -612,4 +650,5 @@ def enregistrer_commandes(application: Application) -> None:
     application.add_handler(CommandHandler("wallets", cmd_wallets, filters=moi))
     application.add_handler(CommandHandler("webhook", cmd_webhook, filters=moi))
     application.add_handler(CommandHandler("score", cmd_score, filters=moi))
+    application.add_handler(CommandHandler("debugtx", cmd_debugtx, filters=moi))
     application.add_handler(CallbackQueryHandler(bouton_ignorer, pattern="^ignorer$"))

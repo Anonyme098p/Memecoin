@@ -91,8 +91,8 @@ CREATE TABLE IF NOT EXISTS analyses_wallets (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     adresse             TEXT NOT NULL,
     date_analyse        TEXT NOT NULL,
-    note                INTEGER NOT NULL,   -- de 0 à 100
-    verdict             TEXT NOT NULL,      -- SUIVRE / À SURVEILLER / ÉVITER
+    note                INTEGER,            -- de 0 à 100 (vide si DONNÉES INSUFFISANTES)
+    verdict             TEXT NOT NULL,      -- SUIVRE / À SURVEILLER / ÉVITER / DONNÉES INSUFFISANTES
     scalpeur            INTEGER NOT NULL,   -- 1 si détention médiane < 2 min
     nb_trades           INTEGER NOT NULL,
     taux_reussite       REAL,               -- entre 0 et 1
@@ -160,12 +160,35 @@ def init_db() -> None:
     os.makedirs(dossier, exist_ok=True)
     with connexion() as conn:
         conn.executescript(SCHEMA)
+        # Mise à jour d'une ancienne base : la note peut maintenant être vide
+        _note_facultative(conn)
         # Mise à jour d'une ancienne base : on ajoute les colonnes manquantes
         for table, colonnes in COLONNES_AJOUTEES.items():
             existantes = {ligne["name"] for ligne in conn.execute(f"PRAGMA table_info({table})")}
             for nom, definition in colonnes.items():
                 if nom not in existantes:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {nom} {definition}")
+
+
+def _note_facultative(conn: sqlite3.Connection) -> None:
+    """
+    Dans la première version, analyses_wallets.note était obligatoire (NOT NULL).
+    SQLite ne sait pas retirer cette contrainte : on recrée la table en gardant les données.
+    """
+    colonnes = {c["name"]: c for c in conn.execute("PRAGMA table_info(analyses_wallets)")}
+    if not colonnes.get("note") or not colonnes["note"]["notnull"]:
+        return
+    conn.executescript("""
+        ALTER TABLE analyses_wallets RENAME TO analyses_wallets_ancienne;
+        CREATE TABLE analyses_wallets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, adresse TEXT NOT NULL, date_analyse TEXT NOT NULL,
+            note INTEGER, verdict TEXT NOT NULL, scalpeur INTEGER NOT NULL, nb_trades INTEGER NOT NULL,
+            taux_reussite REAL, resultat_total_sol REAL, duree_mediane_s REAL, rapport TEXT NOT NULL
+        );
+        INSERT INTO analyses_wallets SELECT * FROM analyses_wallets_ancienne;
+        DROP TABLE analyses_wallets_ancienne;
+        CREATE INDEX IF NOT EXISTS idx_analyses_adresse ON analyses_wallets (adresse, date_analyse);
+    """)
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +255,7 @@ def lire_wallet(adresse: str) -> sqlite3.Row | None:
 
 
 def enregistrer_analyse(
-    adresse: str, note: int, verdict: str, scalpeur: bool, nb_trades: int,
+    adresse: str, note: int | None, verdict: str, scalpeur: bool, nb_trades: int,
     taux_reussite: float | None, resultat_total_sol: float, duree_mediane_s: float | None, rapport: str,
 ) -> None:
     """Garde l'analyse dans l'historique et met à jour la note du wallet s'il est suivi."""

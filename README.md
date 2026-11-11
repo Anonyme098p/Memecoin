@@ -22,7 +22,7 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 ├── modules/
 │   ├── wallets.py       # Suivi des wallets : commandes, alertes, analyse du dimanche
 │   ├── analyse.py       # Analyse d'historique : trades, statistiques, risques, note
-│   ├── transactions.py  # Lecture des transactions Helius (achats / ventes)
+│   ├── transactions.py  # Interprétation d'une transaction : achat, vente ou ignorée (et pourquoi)
 │   ├── helius.py        # Appels à l'API Helius (webhook, infos d'un token)
 │   ├── tokens.py        # Nom, symbole et prix d'un token (Helius + DexScreener)
 │   ├── webhooks.py      # Routes du serveur web (FastAPI), dont /helius
@@ -47,6 +47,7 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `/removewallet <adresse>` | Arrête de suivre un wallet (et met à jour le webhook Helius) |
 | `/wallets` | Liste des wallets suivis, avec leur note et leur verdict |
 | `/score <adresse>` | Analyse un wallet **sans le suivre** et envoie le rapport |
+| `/debugtx <adresse>` | Montre comment les 5 dernières transactions du wallet ont été comprises (achat, vente ou ignorée, et pourquoi) |
 | `/webhook` | État du webhook Helius : URL, type, transactions, actif ou non, adresses synchronisées, secret identique, dernière réception |
 | `/webhook sync` | Force la resynchronisation du webhook Helius, puis affiche son état |
 
@@ -78,7 +79,7 @@ Il est prévu pour tourner 24h/24 sur [Railway](https://railway.com).
 | `SIGNAL_FORT_MIN_WALLETS` | ❌ | Nombre de wallets pour un SIGNAL FORT (défaut : 2) |
 | `SIGNAL_FORT_MINUTES`     | ❌ | Fenêtre de temps du SIGNAL FORT, en minutes (défaut : 10) |
 | `ANALYSE_JOURS`           | ❌ | Nombre de jours d'historique analysés (défaut : 30) |
-| `ANALYSE_MAX_PAGES`       | ❌ | Pages de 100 transactions lues au maximum par analyse (défaut : 10, soit 1 000 transactions) |
+| `ANALYSE_MAX_TRANSACTIONS`| ❌ | Transactions lues au maximum par analyse (défaut : 5000) |
 | `ANALYSE_HEBDO_HEURE`     | ❌ | Heure de l'analyse du dimanche (défaut : 10) |
 | `FUSEAU_HORAIRE`          | ❌ | Fuseau horaire de cette heure (défaut : `Europe/Paris`) |
 | `INTERVALLE_SURVEILLANCE` | ❌ | Secondes entre deux tours de surveillance (défaut : 60) |
@@ -132,13 +133,33 @@ L'analyse est lancée quand tu ajoutes un wallet (`/addwallet`), quand tu tapes
 pour tous les wallets suivis. Si elle dure plus de 2 secondes, le bot envoie d'abord
 « 🔎 Analyse en cours… », puis remplace ce message par le rapport.
 
-**1. Les trades.** Le bot lit les transactions des 30 derniers jours et reconstitue chaque
-trade : il commence au premier achat d'un token (en SOL) et se termine quand le wallet a tout
-revendu (ventes en plusieurs fois comprises). Il calcule le nombre de trades, le taux de
-réussite, le gain moyen, la perte moyenne, le résultat total en SOL et la durée de détention
-(médiane et moyenne). Les tokens encore détenus sont comptés comme « positions ouvertes ».
+**1. L'historique.** Le bot lit, page par page, les transactions des 30 derniers jours
+(5 000 au maximum). Il demande à Helius (`getTransactionsForAddress`) **uniquement les
+transactions réussies où le wallet a envoyé ou reçu un token**. C'est indispensable pour les
+gros traders : leur adresse apparaît dans des milliers de transactions d'autres personnes, le
+plus souvent échouées, qui noieraient leurs vrais trades. Si cette méthode n'est pas disponible
+avec ton offre Helius, le bot se rabat sur l'API Enhanced Transactions (moins précise pour ces
+wallets). Si la limite de 5 000 est atteinte avant 30 jours, le rapport indique la période
+réellement couverte (en heures si elle fait moins de 2 jours).
 
-**2. Les comportements à risque** (🚩 = détecté, ✅ = rien de suspect, ❔ = pas pu vérifier) :
+**2. Achat ou vente ?** Le type annoncé par Helius (SWAP, BUY...) n'est pas utilisé. Pour
+chaque transaction, le bot calcule la **variation de solde du wallet** : par token, et en SOL
+(SOL natif + SOL « emballé » WSOL, frais réseau exclus). Token reçu + SOL dépensé = **achat** ;
+token envoyé + SOL reçu = **vente** ; tout le reste est ignoré (transfert, airdrop, achat en
+USDC, échange token contre token...). Ça marche de la même façon sur pump.fun, PumpSwap,
+Raydium, Jupiter, Meteora... `/debugtx <adresse>` montre ce que le bot a compris de chaque
+transaction.
+
+**3. Les trades.** Les achats et les ventes de chaque token sont appariés selon la méthode
+**FIFO** (premier acheté = premier vendu), ventes partielles comprises. Un trade est terminé
+quand tout le token acheté a été revendu (à 1 % près, pour la « poussière »). Le bot calcule le
+nombre de trades, le taux de réussite, le gain moyen, la perte moyenne, le résultat total en SOL
+et la durée de détention (médiane et moyenne ; pour un trade en plusieurs achats/ventes, c'est
+la durée moyenne pendant laquelle chaque token a été gardé). Les tokens encore détenus sont
+comptés comme « positions ouvertes ». Les ventes de tokens achetés avant les 30 jours sont
+ignorées (prix d'achat inconnu).
+
+**4. Les comportements à risque** (🚩 = détecté, ✅ = rien de suspect, ❔ = pas pu vérifier) :
 
 | Risque | Comment c'est détecté |
 |--------|-----------------------|
@@ -146,11 +167,11 @@ réussite, le gain moyen, la perte moyenne, le résultat total en SOL et la dur�
 | Revend sur ses copieurs | Juste après son achat, une **ruée d'acheteurs** (au moins 3 en 2 minutes, plus de 2 fois le rythme normal), et il revend pendant qu'ils achètent encore. Signalé si c'est au moins 30 % de ses trades rapides et gagnants |
 | Wallet récent | Sa toute première transaction date de **moins de 14 jours** |
 
-**3. SCALPEUR.** Si la durée de détention médiane est **inférieure à 2 minutes**, le wallet est
+**5. SCALPEUR.** Si la durée de détention médiane est **inférieure à 2 minutes**, le wallet est
 marqué ⚡ SCALPEUR : impossible de le copier à la main, ses alertes arrivent trop tard.
 Un SCALPEUR n'est jamais en SUIVRE.
 
-**4. La note sur 100.**
+**6. La note sur 100.**
 
 | Critère | Points |
 |---------|--------|
@@ -161,19 +182,19 @@ Un SCALPEUR n'est jamais en SUIVRE.
 | Copiabilité (détention médiane ≥ 10 min = maximum, < 2 min = 0), seulement si le wallet gagne | 20 |
 | Malus : sniper −20, revend sur ses copieurs −25, wallet récent −15 (−25 s'il a moins de 3 jours) | |
 
-**5. Le verdict.** 🟢 **SUIVRE** à partir de 65, 🟡 **À SURVEILLER** de 40 à 64, 🔴 **ÉVITER**
+**7. Le verdict.** 🟢 **SUIVRE** à partir de 65, 🟡 **À SURVEILLER** de 40 à 64, 🔴 **ÉVITER**
 en dessous de 40. Un SCALPEUR ou un wallet perdant sur la période ne peut pas être en SUIVRE.
-Avec moins de 5 trades terminés, la note est plafonnée à 50 et le verdict reste À SURVEILLER
-(sauf si un comportement à risque est détecté).
+Avec **moins de 10 trades terminés**, il n'y a pas de note : le verdict est
+⚪ **DONNÉES INSUFFISANTES**.
 
 **Chaque dimanche**, tu reçois un résumé (note et verdict de chaque wallet, avec l'ancien
 verdict s'il a changé). Si un wallet **passe en ÉVITER**, tu reçois en plus une alerte avec
 son rapport complet. Tous les seuils sont réglables en haut de `modules/analyse.py`.
 
-**Crédits Helius.** Une analyse lit jusqu'à 10 pages de 100 transactions (100 crédits par page
-avec l'API Enhanced Transactions), plus quelques petites requêtes `getTransactionsForAddress`
-(environ 10 crédits chacune) pour les vérifications de risques. Compte environ 1 000 à 2 000
-crédits par analyse pour un wallet actif.
+**Crédits Helius.** `getTransactionsForAddress` coûte 10 crédits par tranche de 100
+transactions : jusqu'à 500 crédits pour 5 000 transactions, plus quelques centaines de crédits
+pour les vérifications de risques. En repli sur l'API Enhanced, c'est 100 crédits par page de
+100 transactions (jusqu'à 5 000 crédits).
 
 ---
 
