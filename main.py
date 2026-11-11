@@ -19,7 +19,7 @@ from fastapi import FastAPI
 import config
 import db
 import telegram_bot
-from modules import surveillance, webhooks
+from modules import surveillance, wallets, webhooks
 
 # Configuration des logs (visibles dans l'onglet "Deploy Logs" de Railway)
 logging.basicConfig(
@@ -54,8 +54,15 @@ async def cycle_de_vie(app: FastAPI):
 
     tache_surveillance = asyncio.create_task(surveillance.boucle(application))
 
+    # Le domaine Railway a pu changer depuis le dernier démarrage : on remet le webhook Helius à jour
+    message_demarrage = "🚀 Bot démarré."
+    if db.lister_wallets():
+        etat_webhook = await wallets.synchroniser_webhook()
+        log.info(etat_webhook)
+        message_demarrage += "\n" + etat_webhook
+
     try:
-        await telegram_bot.envoyer_message(application, "🚀 Bot démarré.")
+        await telegram_bot.envoyer_message(application, message_demarrage)
     except Exception:
         log.exception("Impossible d'envoyer le message de démarrage (vérifie TELEGRAM_CHAT_ID)")
 

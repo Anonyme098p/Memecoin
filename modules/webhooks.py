@@ -1,20 +1,22 @@
 """
 modules/webhooks.py — Routes du serveur web (FastAPI).
 
-  GET  /                 -> petit message pour vérifier que le serveur répond
-  GET  /health           -> utilisé par Railway pour savoir si l'appli est en vie
-  POST /webhooks/helius  -> recevra plus tard les webhooks Helius (pour l'instant : on log et on répond OK)
+  GET  /         -> petit message pour vérifier que le serveur répond
+  GET  /health   -> utilisé par Railway pour savoir si l'appli est en vie
+  POST /helius   -> reçoit les transactions envoyées par le webhook Helius
 
-Si la variable WEBHOOK_SECRET est définie, l'en-tête "Authorization" de la
-requête doit contenir exactement ce secret (Helius permet de le configurer).
+Sécurité : Helius recopie notre secret (config.WEBHOOK_SECRET) dans l'en-tête
+"Authorization" de chaque requête. Toute requête sans ce secret est refusée.
 """
 
+import hmac
 import logging
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 
 import config
 import db
+from modules import wallets
 
 log = logging.getLogger(__name__)
 
@@ -31,17 +33,31 @@ async def sante() -> dict:
     return {"statut": "ok", "pause": db.est_en_pause()}
 
 
-@router.post("/webhooks/helius")
-async def webhook_helius(request: Request, authorization: str | None = Header(default=None)) -> dict:
-    # Vérification du secret (seulement s'il est configuré)
-    if config.WEBHOOK_SECRET and authorization != config.WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Secret invalide")
+def _vient_de_helius(authorization: str | None) -> bool:
+    """Compare l'en-tête reçu avec notre secret (compare_digest évite les attaques par chronométrage)."""
+    return hmac.compare_digest((authorization or "").encode(), config.WEBHOOK_SECRET.encode())
 
-    donnees = await request.json()
-    nombre = len(donnees) if isinstance(donnees, list) else 1
-    log.info("Webhook Helius reçu : %d événement(s)", nombre)
 
-    # TODO : analyser les transactions reçues et appeler modules.alertes.envoyer_alerte()
-    # L'application Telegram est accessible via : request.app.state.telegram
+@router.post("/helius")
+async def webhook_helius(
+    request: Request,
+    taches: BackgroundTasks,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    if not _vient_de_helius(authorization):
+        log.warning("Requête refusée sur /helius (mauvais en-tête Authorization)")
+        raise HTTPException(status_code=401, detail="Non autorisé")
 
-    return {"recu": nombre}
+    try:
+        donnees = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="JSON invalide")
+
+    # Helius envoie une liste de transactions
+    transactions = donnees if isinstance(donnees, list) else [donnees]
+    log.info("Webhook Helius reçu : %d transaction(s)", len(transactions))
+
+    # Helius veut une réponse en moins d'1 seconde : on répond tout de suite
+    # et on traite les transactions juste après, en arrière-plan.
+    taches.add_task(wallets.traiter_webhook, request.app.state.telegram, transactions)
+    return {"recu": len(transactions)}

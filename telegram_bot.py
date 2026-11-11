@@ -9,12 +9,13 @@ Commandes :
   /status  — état du bot et quelques statistiques
   /pause   — met les alertes en pause
   /resume  — relance les alertes
+  (+ les commandes des modules, ex : /addwallet, /removewallet, /wallets dans modules/wallets.py)
 """
 
 import logging
 import time
 
-from telegram import LinkPreviewOptions, Update
+from telegram import InlineKeyboardMarkup, LinkPreviewOptions, Message, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, filters
 
@@ -55,7 +56,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Commandes disponibles :\n"
         "/status — état du bot\n"
         "/pause — mettre les alertes en pause\n"
-        "/resume — relancer les alertes"
+        "/resume — relancer les alertes\n\n"
+        "/addwallet <adresse> <surnom> — suivre un wallet\n"
+        "/removewallet <adresse> — ne plus suivre un wallet\n"
+        "/wallets — liste des wallets suivis"
     )
 
 
@@ -67,10 +71,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"<b>En ligne depuis :</b> {_duree_lisible(time.time() - HEURE_DEMARRAGE)}\n\n"
         f"<b>Wallets suivis :</b> {stats['wallets']}\n"
         f"<b>Devs suivis :</b> {stats['devs']}\n"
+        f"<b>Achats détectés :</b> {stats['achats']}\n"
         f"<b>Alertes envoyées :</b> {stats['alertes']}\n"
         f"<b>Trades simulés :</b> {stats['trades_ouverts']} ouverts, {stats['trades_fermes']} fermés\n"
         f"<b>PnL simulé :</b> {stats['pnl_total']:+.3f} SOL\n\n"
-        f"<b>Clé Helius :</b> {config.masquer(config.HELIUS_API_KEY)}"
+        f"<b>Clé Helius :</b> {config.masquer(config.HELIUS_API_KEY)}\n"
+        f"<b>Webhook :</b> {config.PUBLIC_URL + '/helius' if config.PUBLIC_URL else '⚠️ PUBLIC_URL non définie'}"
     )
     await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
 
@@ -106,15 +112,27 @@ def construire_application() -> Application:
     application.add_handler(CommandHandler("pause", cmd_pause, filters=SEULEMENT_MOI))
     application.add_handler(CommandHandler("resume", cmd_resume, filters=SEULEMENT_MOI))
 
+    # Commandes des modules (import ici pour éviter une boucle d'imports)
+    from modules import wallets
+    wallets.enregistrer_commandes(application)
+
     application.add_error_handler(gestion_erreurs)
     return application
 
 
-async def envoyer_message(application: Application, texte: str) -> None:
-    """Envoie un message dans ton chat (utilisé pour les alertes et les notifications)."""
-    await application.bot.send_message(
+async def envoyer_message(
+    application: Application,
+    texte: str,
+    boutons: InlineKeyboardMarkup | None = None,
+) -> Message:
+    """
+    Envoie un message dans ton chat (utilisé pour les alertes et les notifications).
+    `boutons` : boutons optionnels affichés sous le message.
+    """
+    return await application.bot.send_message(
         chat_id=config.TELEGRAM_CHAT_ID,
         text=texte,
         parse_mode=ParseMode.HTML,
+        reply_markup=boutons,
         link_preview_options=LinkPreviewOptions(is_disabled=True),  # pas d'aperçu des liens
     )
